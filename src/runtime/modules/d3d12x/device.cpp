@@ -1918,10 +1918,18 @@ HRESULT STDMETHODCALLTYPE create_scarlett_resource_133(ID3D12Device *self, std::
         address <= UINT64_MAX - desc->Width) {
         auto *const buffer = static_cast<ID3D12Resource *>(*resource);
         const std::uint64_t gpu = buffer->GetGPUVirtualAddress();
-        if (gpu) {
+        if (gpu && gpu <= UINT64_MAX - desc->Width) {
             const std::lock_guard lock(buffer_mutex);
             mapped_at[address] = {address + desc->Width, gpu};
             mapped_start[buffer] = address;
+            // track_buffer may index a mappable host buffer by its CPU
+            // mapping rather than its GPU VA. Scarlett slot 70 resolves
+            // the title's address through host_address() and then calls
+            // buffer_at(host GPU VA), which previously found no entry.
+            // Index both the guest VA and the real GPU VA for this same
+            // resource, keeping offsets relative to the buffer start.
+            buffers_at[address] = {address + desc->Width, buffer};
+            buffers_at[gpu] = {gpu + desc->Width, buffer};
         }
     }
     std::fprintf(stderr,
