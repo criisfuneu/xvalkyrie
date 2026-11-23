@@ -45,7 +45,14 @@ ATOM WINAPI register_class_ex_a(const WNDCLASSEXA *description) {
         return 0;
     auto host = *description;
     host.hInstance = host_instance();
-    return RegisterClassExA(&host);
+    const ATOM atom = RegisterClassExA(&host);
+    const DWORD error = atom ? ERROR_SUCCESS : GetLastError();
+    std::fprintf(stderr, "[Runtime] RegisterClassExA: atom=%u error=%lu class=%s\\n",
+                 static_cast<unsigned>(atom), static_cast<unsigned long>(error),
+                 IS_INTRESOURCE(host.lpszClassName) ? "<atom>" :
+                 (host.lpszClassName ? host.lpszClassName : "<null>"));
+    std::fflush(stderr);
+    return atom;
 }
 ATOM WINAPI register_class_w(const WNDCLASSW *description) {
     if (!description)
