@@ -993,11 +993,13 @@ std::uint32_t execute(const std::filesystem::path &path, std::span<const std::ui
                                  "XV_SCARLETT_DEVICE_133",
                                  "XV_SCARLETT_DEVICE_70_127",
                                  "XV_SCARLETT_DESCRIPTOR_ALIAS"}) {
+            // MSVC std::getenv reads the CRT environment, which
+            // SetEnvironmentVariableA alone does not reliably update.
             if (!std::getenv(flag))
-                SetEnvironmentVariableA(flag, "1");
+                _putenv_s(flag, "1");
         }
         // Unknown slots must report unsupported rather than falsely succeeding.
-        SetEnvironmentVariableA("XV_SCARLETT_UNKNOWN_SLOTS", nullptr);
+        _putenv_s("XV_SCARLETT_UNKNOWN_SLOTS", "");
         std::fprintf(stderr,
                      "[Runtime] Scarlett experimental profile: physical placeholders, "
                      "device 70/127/133, descriptor CPU aliases ON; "
