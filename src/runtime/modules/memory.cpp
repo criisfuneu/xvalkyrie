@@ -221,7 +221,7 @@ BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD ty
                                                    MEM_COALESCE_PLACEHOLDERS))) {
         const DWORD error = result ? ERROR_SUCCESS : GetLastError();
         std::fprintf(stderr,
-                     "[Runtime] placeholder VirtualFreeEx(%p, 0x%zx, type 0x%lx) = %d, error %lu\\n",
+                     "[Runtime] placeholder VirtualFreeEx(%p, 0x%zx, type 0x%lx) = %d, error %lu\n",
                      address, static_cast<std::size_t>(size), type, result, error);
         std::fflush(stderr);
         if (!result)
@@ -400,7 +400,7 @@ void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLON
     if (std::getenv("XV_MEM_TRACE") &&
         (reserve_placeholder || replace_placeholder || !result)) {
         std::fprintf(stderr,
-                     "[Runtime] XMemVirtualAlloc(%p, 0x%zx, type 0x%lx, protect 0x%lx) = %p, error %lu, experimental=%d\\n",
+                     "[Runtime] XMemVirtualAlloc(%p, 0x%zx, type 0x%lx, protect 0x%lx) = %p, error %lu, experimental=%d\n",
                      address, static_cast<std::size_t>(size), type, protect, result,
                      error, experimental ? 1 : 0);
         std::fflush(stderr);
