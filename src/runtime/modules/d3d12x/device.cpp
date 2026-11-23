@@ -406,6 +406,16 @@ void console_vtable(void *object, std::size_t host_slots, std::size_t slots,
         block = memory + 1;
     }
     *static_cast<Slot **>(object) = block;
+    if constexpr (Kind == Family::device) {
+        if (console == Target::scarlett && std::getenv("XV_SCARLETT_FAULT_TRACE")) {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett device vtable: object=%p table=%p "
+                         "slot133=%p, extended=%d\n",
+                         object, static_cast<void *>(block), block[133],
+                         block[133] == reinterpret_cast<Slot>(&by_caller<Kind, 133>) ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
 }
 // Methods that return an 8-byte structure: the console's return it in RAX, where the
 // desktop's C++ methods write it through a hidden pointer
@@ -3877,7 +3887,12 @@ void STDMETHODCALLTYPE gpu_hardware_configuration(void *, std::uint64_t *configu
     configuration[0] = static_cast<std::uint64_t>(frequency.QuadPart);
     configuration[1] = console == Target::scarlett ? 5 : 0;
 }
-constexpr std::size_t host_device_slots = 44, device_slots = 128;
+// The Scarlett GDK interface reaches at least method 133. Without these entries
+// the copied host vtable leaves an unrelated host data pointer in slot 133,
+// causing a jump to non-executable memory. Unknown extensions must fail safely
+// until their exact signatures and semantics are implemented.
+constexpr std::size_t host_device_slots = 44, device_slots = 128,
+                      scarlett_device_slots = 136;
 template <std::size_t... Index>
 std::vector<std::pair<std::size_t, Slot>> unknown_device_methods(std::index_sequence<Index...>) {
     return {{host_device_slots + Index,
@@ -4270,7 +4285,11 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (FAILED(result))
         return result;
     auto overrides =
-        unknown_device_methods(std::make_index_sequence<device_slots - host_device_slots>{});
+        unknown_device_methods(std::make_index_sequence<scarlett_device_slots - host_device_slots>{});
+    if (console == Target::durango)
+        std::erase_if(overrides, [](const auto &entry) {
+            return entry.first >= device_slots;
+        });
     overrides.push_back({0, reinterpret_cast<Slot>(&device_query)});
     overrides.push_back({13, reinterpret_cast<Slot>(&check_feature_support)});
     overrides.push_back({14, reinterpret_cast<Slot>(&create_descriptor_heap)});
@@ -4339,7 +4358,8 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});
     }
     // all of the host's vtable, which its runtime calls past the desktop's first 44 too
-    console_vtable<Family::device>(host, 96, device_slots, overrides);
+    console_vtable<Family::device>(
+        host, 96, console == Target::scarlett ? scarlett_device_slots : device_slots, overrides);
     // through the console's QueryInterface, which knows the kits' interface IDs
     const auto queried = device_query(host, iid, device);
     host->Release();
