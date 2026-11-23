@@ -591,6 +591,7 @@ struct ShadowHeap {
     std::uint64_t gpu; // the host's GPU handle of the start, for a shader-visible heap
     UINT host_stride;
     void *owner; // the heap the title holds
+    std::uintptr_t gpu_alias = 0; // guest virtual GPU descriptor address, translated on use
 };
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
 // methods copy descriptors of these sizes themselves
@@ -622,6 +623,17 @@ const ShadowHeap *shadow_heap(std::uintptr_t address) {
         return nullptr;
     --found;
     return address < found->second.end ? &found->second : nullptr;
+}
+// Call with shadow_mutex held. A Scarlett title can request GPU descriptor addresses
+// distinct from our CPU-writable shadow heap. Translate those logical handles to
+// the corresponding shadow offset before passing handles to the host D3D12 runtime.
+std::uintptr_t shadow_gpu_address(std::uintptr_t guest_gpu) {
+    for (const auto &[base, heap] : shadow_heaps) {
+        if (heap.gpu_alias && guest_gpu >= heap.gpu_alias &&
+            guest_gpu - heap.gpu_alias < heap.end - heap.base)
+            return base + (guest_gpu - heap.gpu_alias);
+    }
+    return guest_gpu;
 }
 // the host's handle for a console one; others are the host's already
 D3D12_CPU_DESCRIPTOR_HANDLE host_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -807,8 +819,45 @@ std::uint64_t STDMETHODCALLTYPE gpu_heap_start(void *self) {
     {
         const std::lock_guard lock(shadow_mutex);
         const auto found = shadow_of.find(self);
-        if (found != shadow_of.end() && shadow_heaps[found->second].shader_visible)
-            return found->second;
+        if (found != shadow_of.end()) {
+            auto heap = shadow_heaps.find(found->second);
+            if (heap != shadow_heaps.end() && heap->second.shader_visible) {
+                // The title checks that its requested GPU descriptor start equals
+                // GetGPUDescriptorHandleForHeapStart. The host heap is elsewhere,
+                // so translate the guest's logical GPU handle rather than faking a
+                // resource allocation. This branch is deliberately title-specific
+                // and must be explicitly enabled for the experimental startup path.
+                if (std::getenv("XV_SCARLETT_DESCRIPTOR_ALIAS") &&
+                    detail::guest_offset(_ReturnAddress()) == 0x1cf335b &&
+                    !heap->second.gpu_alias) {
+                    constexpr std::uint64_t call_after = 0x1cf335b;
+                    constexpr std::uint64_t guest_requested_gpu = 0x75df188;
+                    const auto guest_base =
+                        reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - call_after;
+                    std::uintptr_t wanted = 0;
+                    SIZE_T bytes = 0;
+                    const bool readable =
+                        ReadProcessMemory(GetCurrentProcess(),
+                                          reinterpret_cast<const void *>(guest_base +
+                                                                         guest_requested_gpu),
+                                          &wanted, sizeof wanted, &bytes) &&
+                        bytes == sizeof wanted;
+                    if (readable && wanted &&
+                        wanted <= UINTPTR_MAX - (heap->second.end - heap->second.base)) {
+                        heap->second.gpu_alias = wanted;
+                        std::fprintf(stderr,
+                                     "[Runtime] Scarlett descriptor GPU alias: shadow=%p "
+                                     "guest=%p bytes=0x%llx\n",
+                                     reinterpret_cast<void *>(heap->second.base),
+                                     reinterpret_cast<void *>(wanted),
+                                     static_cast<unsigned long long>(
+                                         heap->second.end - heap->second.base));
+                        std::fflush(stderr);
+                    }
+                }
+                return heap->second.gpu_alias ? heap->second.gpu_alias : found->second;
+            }
+        }
     }
     return static_cast<HeapProxy *>(self)->host->GetGPUDescriptorHandleForHeapStart().ptr;
 }
@@ -1172,14 +1221,15 @@ void decode_table(const void *signature, UINT parameter, std::uint64_t gpu) {
         ranges = found->second[parameter];
     }
     ShadowHeap heap{};
+    std::uintptr_t table = gpu;
     {
         const std::lock_guard lock(shadow_mutex);
-        const auto *found = shadow_heap(gpu);
+        table = shadow_gpu_address(gpu);
+        const auto *found = shadow_heap(table);
         if (!found || !found->shader_visible)
             return;
         heap = *found;
     }
-    const std::uintptr_t table = gpu;
     for (const auto &range : ranges)
         for (UINT i = 0; i < range.count; ++i) {
             const auto at = table + std::uintptr_t{range.offset + i} * heap.stride;
@@ -2900,7 +2950,7 @@ void bind_heap_of(void *self, std::uint64_t handle) {
     bool samplers = false;
     {
         const std::lock_guard lock(shadow_mutex);
-        const auto *heap = shadow_heap(handle);
+        const auto *heap = shadow_heap(shadow_gpu_address(handle));
         if (!heap || !heap->shader_visible)
             return;
         owner = heap->owner;
@@ -2930,8 +2980,9 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
 // the host's GPU handle for a console one, which is the descriptor's address in the shadow
 D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
     const std::lock_guard lock(shadow_mutex);
-    if (const auto *heap = shadow_heap(handle.ptr); heap && heap->shader_visible)
-        return {heap->gpu + (handle.ptr - heap->base) / heap->stride * heap->host_stride};
+    const auto address = shadow_gpu_address(handle.ptr);
+    if (const auto *heap = shadow_heap(address); heap && heap->shader_visible)
+        return {heap->gpu + (address - heap->base) / heap->stride * heap->host_stride};
     return handle;
 }
 // The root signatures and descriptor tables: the title's own descriptors in a table are read
