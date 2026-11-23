@@ -2435,8 +2435,17 @@ std::uint64_t STDMETHODCALLTYPE list_method(void *self, std::uint64_t a, std::ui
         return E_NOTIMPL;
     }
     auto *const host = host_of(self);
-    return reinterpret_cast<Raw>((*reinterpret_cast<Slot **>(host))[target])(host, a, b, c, d, e, f,
-                                                                             g, h, i, j);
+    const auto result = reinterpret_cast<Raw>((*reinterpret_cast<Slot **>(host))[target])(
+        host, a, b, c, d, e, f, g, h, i, j);
+    // Targeted diagnostics for the startup graphics path. Do not change behavior.
+    if (Index == 9) {
+        std::fprintf(stderr,
+                     "[Runtime] Direct3D 12 command list Close: result=0x%08llx from %s\n",
+                     static_cast<unsigned long long>(result),
+                     detail::guest_location(_ReturnAddress()).c_str());
+        std::fflush(stderr);
+    }
+    return result;
 }
 HRESULT STDMETHODCALLTYPE list_query(void *self, REFIID iid, void **object) {
     if (!object)
