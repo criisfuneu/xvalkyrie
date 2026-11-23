@@ -28,6 +28,9 @@ constexpr GUID file_iid{
     0x43704f9f, 0x27c6, 0x4a9f, {0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4}};
 constexpr GUID factory_iid{
     0xfb3b54ac, 0xbf82, 0x463a, {0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d}};
+// Additional factory IID observed in the target title. The ABI still needs runtime validation.
+constexpr GUID alternate_factory_iid{
+    0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
 constexpr GUID status_iid{
     0xcd66d752, 0x2786, 0x44f7, {0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b}};
 constexpr GUID queue_iid{
@@ -419,8 +422,16 @@ class Factory final : public Object<FactoryInterface> {
 HRESULT WINAPI get_factory(const GUID *iid, void **factory) {
     if (!iid || !factory)
         return E_POINTER;
+    *factory = nullptr;
     static Factory *const one = new Factory;
-    return one->QueryInterface(*iid, factory);
+    const bool alternate = *iid == alternate_factory_iid;
+    const HRESULT result = one->QueryInterface(alternate ? factory_iid : *iid, factory);
+    std::fprintf(stderr,
+                 "[Runtime] DirectStorage factory: IID %08lx-%04x-%04x, alternate=%d, "
+                 "HRESULT=0x%08lx, object=%p\n",
+                 static_cast<unsigned long>(iid->Data1), iid->Data2, iid->Data3,
+                 alternate ? 1 : 0, static_cast<unsigned long>(result), *factory);
+    return result;
 }
 } // namespace
 
