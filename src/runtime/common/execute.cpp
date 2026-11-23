@@ -558,6 +558,45 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
             std::filesystem::path(name).filename().c_str(),
             static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(host)));
     }
+    // Observed Scarlett RAGE init assertion at image+0x247af2d:
+    //   ([rsp+0x78] - [rsp+0x70]) + [image+0x75e6ff0] <= 0x1fffff
+    // Report the actual operands on the first fault rather than guessing the
+    // pool size or masking the guest's INT3.
+    if (record->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        is_guest(record->ExceptionAddress) &&
+        address - guest->base == 0x247af2d && info->ContextRecord) {
+        const auto *context = info->ContextRecord;
+        const auto get64 = [](std::uint64_t location, std::uint64_t &value) {
+            SIZE_T bytes = 0;
+            return ReadProcessMemory(GetCurrentProcess(),
+                                     reinterpret_cast<const void *>(location),
+                                     &value, sizeof value, &bytes) &&
+                   bytes == sizeof value;
+        };
+        std::uint64_t begin = 0, end = 0, accumulated = 0;
+        const bool values = context->Rsp <= UINT64_MAX - 0x78 &&
+                            get64(context->Rsp + 0x70, begin) &&
+                            get64(context->Rsp + 0x78, end) &&
+                            get64(guest->base + 0x75e6ff0, accumulated);
+        if (values) {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett 2MiB pool assertion: "
+                         "start=0x%llx end=0x%llx used=0x%llx "
+                         "span=0x%llx total=0x%llx limit=0x1fffff "
+                         "rax=0x%llx\\n",
+                         static_cast<unsigned long long>(begin),
+                         static_cast<unsigned long long>(end),
+                         static_cast<unsigned long long>(accumulated),
+                         static_cast<unsigned long long>(end - begin),
+                         static_cast<unsigned long long>(end - begin + accumulated),
+                         static_cast<unsigned long long>(context->Rax));
+        } else {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett 2MiB pool assertion: "
+                         "could not read all operand addresses, rax=0x%llx\\n",
+                         static_cast<unsigned long long>(context->Rax));
+        }
+    }
     if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
         MEMORY_BASIC_INFORMATION region{};
         VirtualQuery(reinterpret_cast<void *>(record->ExceptionInformation[1]), &region,
