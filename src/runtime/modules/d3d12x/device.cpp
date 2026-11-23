@@ -14,6 +14,8 @@
 #include <cstring>
 #include <d3d12.h>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <dxgi1_6.h>
 #include <intrin.h>
 #include <map>
@@ -1979,12 +1981,75 @@ std::span<const std::uint8_t> shader_bytes(const D3D12_SHADER_BYTECODE &code) {
         return {};
     return {static_cast<const std::uint8_t *>(code.pShaderBytecode), code.BytecodeLength};
 }
+// Optional shader bridge from Leonida's offline SPIR-V translation. The companion
+// tools/leonida_dxil_bridge.py converts those modules to Windows DXIL containers.
+// An exact FNV-1a hash of the original title container identifies each one; never
+// use the Leonida artifact for a different guest shader or stage. The default path
+// is unchanged and remains the fallback if a cache entry is absent or not DXIL.
+std::span<const std::uint8_t> leonida_dxil(modules::ShaderStage stage,
+                                           std::span<const std::uint8_t> original) {
+    const char *root = std::getenv("XV_LEONIDA_DXIL_DIR");
+    if (!root || !*root || original.empty())
+        return {};
+    const char *prefix = nullptr;
+    switch (stage) {
+    case modules::ShaderStage::vertex: prefix = "vs"; break;
+    case modules::ShaderStage::pixel: prefix = "ps"; break;
+    case modules::ShaderStage::compute: prefix = "cs"; break;
+    case modules::ShaderStage::geometry_points:
+    case modules::ShaderStage::geometry_lines:
+    case modules::ShaderStage::geometry_triangles: prefix = "gs"; break;
+    }
+    if (!prefix)
+        return {};
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto byte : original) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    char filename[64]{};
+    std::snprintf(filename, sizeof filename, "%s-%016llx.dxil", prefix,
+                  static_cast<unsigned long long>(hash));
+    const auto path = std::filesystem::path(root) / filename;
+    static std::mutex mutex;
+    static std::map<std::string, std::vector<std::uint8_t>> loaded;
+    const std::lock_guard lock(mutex);
+    const auto key = path.string();
+    if (const auto it = loaded.find(key); it != loaded.end())
+        return it->second;
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in)
+        return {};
+    const auto length = in.tellg();
+    if (length < 32 || length > 32 * 1024 * 1024)
+        return {};
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length));
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char *>(bytes.data()), bytes.size()))
+        return {};
+    if (!modules::shader_has_dxil(bytes)) {
+        std::fprintf(stderr, "[Runtime] Leonida shader rejected (not DXIL): %s\\n",
+                     filename);
+        return {};
+    }
+    const auto [it, inserted] = loaded.emplace(key, std::move(bytes));
+    if (inserted) {
+        std::fprintf(stderr, "[Runtime] Leonida DXIL bridge: %s (%zu bytes)\\n",
+                     filename, it->second.size());
+        std::fflush(stderr);
+    }
+    return it->second;
+}
 bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
                    modules::HostShaderModel model = modules::HostShaderModel::sm5,
                    std::span<const modules::PackedInput> packed = {}) {
     const auto container = shader_bytes(code);
     if (!code.pShaderBytecode || !modules::console_only_shader(container))
         return false;
+    if (const auto hybrid = leonida_dxil(stage, container); !hybrid.empty()) {
+        code = {hybrid.data(), hybrid.size()};
+        return true;
+    }
     const auto made = modules::host_shader(stage, container, model, packed);
     if (made.empty())
         return false;
