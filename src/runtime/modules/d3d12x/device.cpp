@@ -2423,6 +2423,24 @@ std::uint64_t STDMETHODCALLTYPE list_method(void *self, std::uint64_t a, std::ui
             Index, a, b, c, d, e, detail::guest_location(_ReturnAddress()).c_str());
         std::fflush(stderr);
     }
+    // Experimental Scarlett compatibility fallback. The exact ABI and semantics of
+    // these extension slots have not been established; do not forward them to an
+    // unrelated desktop vtable entry. Opt in explicitly for startup experiments.
+    if constexpr (Index == 131 || Index == 132) {
+        static const bool allow_unknown = std::getenv("XV_SCARLETT_UNKNOWN_SLOTS") != nullptr;
+        if (allow_unknown) {
+            if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+                std::fprintf(stderr,
+                             "[Runtime] experimental Scarlett slot %zu: returning S_OK "
+                             "without GPU operation; args=%llx,%llx from %s\\n",
+                             Index, static_cast<unsigned long long>(a),
+                             static_cast<unsigned long long>(b),
+                             detail::guest_location(_ReturnAddress()).c_str());
+                std::fflush(stderr);
+            }
+            return S_OK;
+        }
+    }
     const auto target = list_map[Index];
     if (target == unmapped) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
