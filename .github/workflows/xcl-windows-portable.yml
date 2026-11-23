@@ -1,0 +1,47 @@
+name: Build XCL upstream Windows portable
+on:
+  workflow_dispatch:
+  push:
+    branches: [experiment/leonida-hybrid]
+    paths: [.github/workflows/xcl-windows-portable.yml]
+permissions:
+  contents: read
+jobs:
+  xcl-windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout verified upstream XCL source
+        uses: actions/checkout@v4
+        with:
+          repository: ivall/xcl
+          ref: 956a476bf738a098f39df4f4c8acef682e43030f
+          persist-credentials: false
+      - name: Install stable Rust for MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Compile XCL release from source
+        run: cargo build --release --locked --workspace
+      - name: Check executable and version
+        shell: pwsh
+        run: |
+          if (!(Test-Path target/release/xcl.exe)) { throw "xcl.exe missing" }
+          Get-Item target/release/xcl.exe | Select-Object Name,Length
+          Get-FileHash -Algorithm SHA256 target/release/xcl.exe | Format-List
+      - name: Package executable with source provenance
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/xcl.exe dist/xcl.exe
+          Copy-Item README.md dist/XCL_README.md
+          Copy-Item LICENSE dist/LICENSE.txt
+          Copy-Item THIRD_PARTY.md dist/THIRD_PARTY.md
+          Set-Content -Path dist/BUILD_SOURCE.txt -Value 'XCL upstream: https://github.com/ivall/xcl ; commit: 956a476bf738a098f39df4f4c8acef682e43030f ; executable is experimental and does not guarantee playable GTA VI.'
+      - name: Upload portable XCL
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-windows-956a476
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
