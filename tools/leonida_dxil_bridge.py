@@ -124,7 +124,11 @@ def main() -> int:
                 blob = dxil.read_bytes()
                 if len(blob) < 32 or blob[:4] != b"DXBC":
                     raise ValueError("DXC result has no DXIL container header")
-                os.replace(dxil, dest)
+                # Temporary files may reside on C: while the cache is on D:.
+                # Stage the finished shader in the destination directory first.
+                staged = dest.with_suffix(".tmp")
+                shutil.copyfile(dxil, staged)
+                os.replace(staged, dest)
                 counts["converted"] += 1
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
                     ValueError) as exc:
