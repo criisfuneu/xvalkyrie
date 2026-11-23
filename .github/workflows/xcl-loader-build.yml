@@ -1,0 +1,47 @@
+name: Build XCL experimental loader fix (Windows)
+
+on:
+  push:
+    branches:
+      - xcl-fix-experimental-20261123
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-xcl:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v4
+      - name: Check out pinned XCL source
+        shell: pwsh
+        run: |
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          git -C xcl-src checkout eaa36b62768fe1eedb87d010a19148854c9a3952
+      - name: Apply isolated source patch
+        shell: pwsh
+        run: py experimental/xcl/apply_fix.py xcl-src
+      - name: Check compiler availability
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+      - name: Build release binary for Windows
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release -p xcl
+      - name: Run library unit tests
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test -p xcl --lib
+      - name: Upload experimental Windows executable
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: xcl-windows-experimental
+          path: xcl-src/target/release/xcl.exe
+          if-no-files-found: error
+          retention-days: 7
