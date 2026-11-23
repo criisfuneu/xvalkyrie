@@ -1,4 +1,4 @@
-name: Build XCL upstream Windows portable
+name: Build XCL Windows + official Microsoft DXC
 on:
   workflow_dispatch:
   push:
@@ -11,7 +11,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
-      - name: Checkout verified upstream XCL source
+      - name: Checkout pinned upstream XCL source
         uses: actions/checkout@v4
         with:
           repository: ivall/xcl
@@ -23,25 +23,84 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Compile XCL release from source
         run: cargo build --release --locked --workspace
-      - name: Check executable and version
+      - name: Download official Microsoft DXC release (September 2026)
         shell: pwsh
         run: |
-          if (!(Test-Path target/release/xcl.exe)) { throw "xcl.exe missing" }
-          Get-Item target/release/xcl.exe | Select-Object Name,Length
-          Get-FileHash -Algorithm SHA256 target/release/xcl.exe | Format-List
-      - name: Package executable with source provenance
-        shell: pwsh
-        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip'
+          Invoke-WebRequest -Uri $url -OutFile dxc_release.zip -MaximumRedirection 10
+          Expand-Archive -Path dxc_release.zip -DestinationPath dxc_release -Force
+          $compiler = Get-ChildItem dxc_release -Recurse -File -Filter dxcompiler.dll |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $compiler) { throw 'Official DXC release did not contain x64/dxcompiler.dll' }
+          $validator = Join-Path $compiler.Directory.FullName 'dxil.dll'
+          if (-not (Test-Path $validator)) { throw 'Official DXC release did not contain paired dxil.dll' }
           New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $compiler.FullName dist/dxcompiler.dll
+          Copy-Item $validator dist/dxil.dll
+          Get-Item dist/dxcompiler.dll,dist/dxil.dll | Select-Object Name, Length
+      - name: Package XCL with single-click launcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
           Copy-Item target/release/xcl.exe dist/xcl.exe
           Copy-Item README.md dist/XCL_README.md
-          Copy-Item LICENSE dist/LICENSE.txt
-          Copy-Item THIRD_PARTY.md dist/THIRD_PARTY.md
-          Set-Content -Path dist/BUILD_SOURCE.txt -Value 'XCL upstream: https://github.com/ivall/xcl ; commit: 956a476bf738a098f39df4f4c8acef682e43030f ; executable is experimental and does not guarantee playable GTA VI.'
-      - name: Upload portable XCL
+          Copy-Item LICENSE dist/XCL_LICENSE.txt
+          Copy-Item THIRD_PARTY.md dist/XCL_THIRD_PARTY.md
+          @(
+            '@echo off'
+            'setlocal'
+            'cd /d "%~dp0"'
+            'set "GAME=D:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK"'
+            'if not exist "%GAME%\game_scarlett_master.exe" ('
+            ' echo Executavel nao encontrado em "%GAME%"'
+            ' pause'
+            ' exit /b 2'
+            ')'
+            'if not exist "%~dp0dxcompiler.dll" ('
+            ' echo Erro: dxcompiler.dll ausente'
+            ' pause'
+            ' exit /b 3'
+            ')'
+            'if not exist "%~dp0dxil.dll" ('
+            ' echo Erro: dxil.dll ausente'
+            ' pause'
+            ' exit /b 4'
+            ')'
+            'echo XCL experimental, origem do executavel GTA nao verificada.'
+            'echo O jogo NAO tem execucao jogavel comprovada. Teste somente em ambiente isolado.'
+            'echo.'
+            '"%~dp0xcl.exe" run "%GAME%"'
+            'echo.'
+            'echo Processo encerrado. Codigo: %errorlevel%'
+            'echo Relatorio XCL: %%LOCALAPPDATA%%\XCL\RockstarGamesInc.28872443D20A7\logs\report.json'
+            'pause'
+          ) | Set-Content -Path dist/INICIAR_XCL.cmd -Encoding ASCII
+          @(
+            'XCL Windows experimental - BUILD REPRODUZIVEL'
+            'Fonte XCL: https://github.com/ivall/xcl'
+            'Commit XCL: 956a476bf738a098f39df4f4c8acef682e43030f'
+            'DXC Microsoft oficial: v1.9.2609, publicado 29 setembro 2026'
+            'https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.9.2609'
+            ''
+            'O pacote inclui xcl.exe, dxcompiler.dll e dxil.dll x64.'
+            'INICIAR_XCL.cmd usa o caminho do jogo fornecido por voce.'
+            'Para outro caminho, edite GAME no arquivo .cmd.'
+            ''
+            'NAO HA GARANTIA de tela, som ou gameplay. Faltas de DXC foram removidas.'
+            'Uma violacao/breakpoint 0x80000003 nao e necessariamente causado por DXC.'
+            'Game binaries do fornecedor nao foram autenticados nem analisados por antivírus.'
+            'Nao execute binarios desconhecidos no seu Windows pessoal.'
+          ) | Set-Content -Path dist/LEIA_PRIMEIRO.txt -Encoding UTF8
+          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 |
+            Select-Object @{n='File';e={$_.Path | Split-Path -Leaf}},Hash |
+            Format-Table -AutoSize | Out-String | Set-Content -Path dist/SHA256.txt
+          if (!(Test-Path dist/xcl.exe)) { throw 'xcl.exe missing' }
+      - name: Upload ready-to-test Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: xcl-windows-956a476
+          name: XCL-Windows-DXC-Oficial-2026
           path: dist/
           if-no-files-found: error
           retention-days: 14
