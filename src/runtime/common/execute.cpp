@@ -583,7 +583,7 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
                          "[Runtime] Scarlett 2MiB pool assertion: "
                          "start=0x%llx end=0x%llx used=0x%llx "
                          "span=0x%llx total=0x%llx limit=0x1fffff "
-                         "rax=0x%llx\\n",
+                         "rax=0x%llx\n",
                          static_cast<unsigned long long>(begin),
                          static_cast<unsigned long long>(end),
                          static_cast<unsigned long long>(accumulated),
@@ -593,7 +593,7 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
         } else {
             std::fprintf(stderr,
                          "[Runtime] Scarlett 2MiB pool assertion: "
-                         "could not read all operand addresses, rax=0x%llx\\n",
+                         "could not read all operand addresses, rax=0x%llx\n",
                          static_cast<unsigned long long>(context->Rax));
         }
     }
