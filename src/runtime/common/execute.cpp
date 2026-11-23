@@ -980,6 +980,30 @@ std::uint32_t execute(const std::filesystem::path &path, std::span<const std::ui
         throw std::runtime_error("The image is a DLL, not an executable");
     if (!pe.at("entry_rva").get<std::uint64_t>())
         throw std::runtime_error("The image has no entry point");
+    // Opt-in compatibility shims selected automatically for the one observed
+    // Scarlett image, before loading its imports. A prior hybrid build only
+    // enabled these shims when the shell set four environment variables, which
+    // silently regressed to the unpatched path when started without them.
+    // The size+basename guards select a compatibility PROFILE, not a trust
+    // check or proof that the image is the retail game.
+    if (!std::getenv("XV_HYBRID_DISABLE_AUTOFIX") &&
+        path.filename().wstring() == L"game_scarlett_master.exe" &&
+        file.size() == 120181760ull) {
+        for (const auto *flag : {"XV_SCARLETT_PLACEHOLDERS",
+                                 "XV_SCARLETT_DEVICE_133",
+                                 "XV_SCARLETT_DEVICE_70_127",
+                                 "XV_SCARLETT_DESCRIPTOR_ALIAS"}) {
+            if (!std::getenv(flag))
+                SetEnvironmentVariableA(flag, "1");
+        }
+        // Unknown slots must report unsupported rather than falsely succeeding.
+        SetEnvironmentVariableA("XV_SCARLETT_UNKNOWN_SLOTS", nullptr);
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett experimental profile: physical placeholders, "
+                     "device 70/127/133, descriptor CPU aliases ON; "
+                     "unknown methods remain guarded\\n");
+        std::fflush(stderr);
+    }
     // Delay-load imports are bound by the image's own helper on first use, through
     // LoadLibrary and GetProcAddress or ResolveDelayLoadedAPI, which are ours.
 
