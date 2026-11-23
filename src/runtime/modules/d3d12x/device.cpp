@@ -1636,6 +1636,43 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
                         console == Target::scarlett ? desc : nullptr);
     return result;
 }
+// In the later Scarlett device table the title calls slot 133 with the same
+// seven-argument layout as CreatePlacedResourceX: virtual address, resource
+// description, state, clear value, IID_ID3D12Resource, output. The exact kit
+// definition is not yet available; this translation is deliberately opt-in.
+HRESULT STDMETHODCALLTYPE create_scarlett_resource_133(ID3D12Device *self, std::uint64_t address,
+                                                      const D3D12_RESOURCE_DESC *desc,
+                                                      D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE *clear, REFIID iid,
+                                                      void **resource) {
+    if (!desc || !resource || iid != __uuidof(ID3D12Resource)) {
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett device slot 133: invalid resource request desc=%p "
+                     "output=%p\n", desc, resource);
+        std::fflush(stderr);
+        return E_INVALIDARG;
+    }
+    // The title passes ~0u for the initial state at its startup buffer creation.
+    // On the desktop this is not a valid resource-state mask. Use COMMON when
+    // creating a buffer, and leave every other state unchanged.
+    const auto host_state_133 =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                static_cast<std::uint32_t>(state) == 0xffffffffu
+            ? D3D12_RESOURCE_STATE_COMMON
+            : state;
+    const HRESULT hr =
+        create_placed_resource_x(self, address, desc, host_state_133, clear, iid, resource);
+    std::fprintf(stderr,
+                 "[Runtime] Scarlett device slot 133: address=0x%llx dim=%u size=0x%llx "
+                 "state=0x%x mapped_state=0x%x HRESULT=0x%08lx resource=%p\n",
+                 static_cast<unsigned long long>(address),
+                 static_cast<unsigned>(desc->Dimension),
+                 static_cast<unsigned long long>(desc->Width),
+                 static_cast<unsigned>(state), static_cast<unsigned>(host_state_133),
+                 static_cast<unsigned long>(hr), resource ? *resource : nullptr);
+    std::fflush(stderr);
+    return hr;
+}
 // The console's GPU draws rectangle lists and quad lists (topology types 19 and 32, the
 // topologies 17 and 19). Here both are triangles: a quad list through indices of ours (see
 // draw_instanced), a rectangle list through a geometry shader of ours (see
@@ -2442,7 +2479,7 @@ std::uint64_t STDMETHODCALLTYPE list_method(void *self, std::uint64_t a, std::ui
             if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
                 std::fprintf(stderr,
                              "[Runtime] experimental Scarlett slot %zu: returning S_OK "
-                             "without GPU operation; args=%llx,%llx from %s\\n",
+                             "without GPU operation; args=%llx,%llx from %s\n",
                              Index, static_cast<unsigned long long>(a),
                              static_cast<unsigned long long>(b),
                              detail::guest_location(_ReturnAddress()).c_str());
@@ -4356,6 +4393,13 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({86, reinterpret_cast<Slot>(&create_pipeline_state)});
         overrides.push_back({109, reinterpret_cast<Slot>(&create_committed_resource_2)});
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});
+    }
+    // Opt-in mapping for the later Scarlett CreatePlacedResource-style ABI.
+    if (console == Target::scarlett && std::getenv("XV_SCARLETT_DEVICE_133")) {
+        overrides.push_back({133, reinterpret_cast<Slot>(&create_scarlett_resource_133)});
+        std::fprintf(stderr,
+                     "[Runtime] enabled experimental Scarlett D3D12 device slot 133 resource creation\n");
+        std::fflush(stderr);
     }
     // all of the host's vtable, which its runtime calls past the desktop's first 44 too
     console_vtable<Family::device>(
