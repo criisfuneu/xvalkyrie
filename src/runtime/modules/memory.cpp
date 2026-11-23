@@ -100,9 +100,27 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
     unmap(state, reservation, address);
     auto *const at = reinterpret_cast<void *>(address);
     if (!MapViewOfFile3(state.section, nullptr, at, number * page, page, MEM_REPLACE_PLACEHOLDER,
-                        PAGE_READWRITE, nullptr, 0) ||
-        !VirtualAlloc(at, page, MEM_COMMIT, PAGE_READWRITE))
+                        PAGE_READWRITE, nullptr, 0)) {
+        const DWORD error = GetLastError();
+        if (std::getenv("XV_MEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[Runtime] physical MapViewOfFile3 failed: at=%p, page=%llu, error=%lu\n",
+                         at, static_cast<unsigned long long>(number), error);
+            std::fflush(stderr);
+        }
+        SetLastError(error);
         return false;
+    }
+    if (!VirtualAlloc(at, page, MEM_COMMIT, PAGE_READWRITE)) {
+        const DWORD error = GetLastError();
+        if (std::getenv("XV_MEM_TRACE")) {
+            std::fprintf(stderr, "[Runtime] physical VirtualAlloc COMMIT failed: at=%p, error=%lu\n",
+                         at, error);
+            std::fflush(stderr);
+        }
+        SetLastError(error);
+        return false;
+    }
     if (owned && state.dirty[number])
         std::memset(at, 0, page);
     state.dirty[number] = false;
@@ -200,6 +218,23 @@ BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD ty
         const auto at = reinterpret_cast<std::uintptr_t>(address);
         std::uintptr_t base = 0;
         if (auto *const reservation = reservation_at(state, at, &base)) {
+            // An XMem placeholder reservation is already split into 64 KiB placeholders
+            // by reserve(). The title's MEM_PRESERVE_PLACEHOLDER split is therefore a
+            // successful no-op; it must NOT release the entire tracked reservation.
+            if (type == (MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                const bool valid = size && !(at & (page - 1)) && !(size & (page - 1)) &&
+                                   at >= base && size <= reservation->size &&
+                                   at - base <= reservation->size - size;
+                if (std::getenv("XV_MEM_TRACE")) {
+                    std::fprintf(stderr,
+                                 "[Runtime] tracked placeholder split(%p, 0x%zx) = %d\n",
+                                 address, static_cast<std::size_t>(size), valid ? 1 : 0);
+                    std::fflush(stderr);
+                }
+                if (!valid)
+                    SetLastError(ERROR_INVALID_PARAMETER);
+                return valid ? TRUE : FALSE;
+            }
             const bool release = type & MEM_RELEASE;
             if (release && at != base) {
                 SetLastError(ERROR_INVALID_PARAMETER);
@@ -384,15 +419,26 @@ void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLON
     const bool reserve_placeholder = (type & MEM_RESERVE_PLACEHOLDER) != 0;
     const bool replace_placeholder = (type & MEM_REPLACE_PLACEHOLDER) != 0;
     void *result = nullptr;
-    if (experimental && (reserve_placeholder || replace_placeholder)) {
-        const DWORD host_type = reserve_placeholder
-                                    ? MEM_RESERVE | MEM_RESERVE_PLACEHOLDER
-                                    : MEM_RESERVE | MEM_REPLACE_PLACEHOLDER;
-        // Xbox-specific physical/large-page bits cannot be blindly passed to the host API.
-        // This tries a private placeholder replacement; it is NOT physical Xbox page mapping.
-        result = VirtualAlloc2(GetCurrentProcess(), address, size, host_type,
-                               reserve_placeholder ? PAGE_NOACCESS : (protect & protections),
-                               nullptr, 0);
+    if (experimental && reserve_placeholder && !replace_placeholder) {
+        // Keep the host placeholders in the same reservation registry that
+        // XMemMapPhysicalPages uses. reserve() also splits them into 64 KiB views.
+        result = reserve(address, size, type);
+    } else if (experimental && replace_placeholder && !reserve_placeholder) {
+        // The title will back these ranges with XMemMapPhysicalPages immediately after
+        // allocating physical page indices. Leave each placeholder intact until then;
+        // replacing it with private committed memory would make MapViewOfFile3 fail.
+        auto &state = physical();
+        const std::lock_guard lock(state.mutex);
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        std::uintptr_t base = 0;
+        const auto *reservation = reservation_at(state, at, &base);
+        if (address && reservation && !(at & (page - 1)) && size &&
+            !(size & (page - 1)) && size <= reservation->size &&
+            at - base <= reservation->size - size) {
+            result = address;
+        } else {
+            SetLastError(ERROR_INVALID_ADDRESS);
+        }
     } else {
         result = virtual_alloc(address, size, type, protect);
     }
@@ -410,15 +456,39 @@ void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLON
     return result;
 }
 BOOL WINAPI xmem_allocate_physical_pages(ULONGLONG flags, ULONG_PTR *count, ULONG_PTR *pages) {
+    const ULONG_PTR requested = count ? *count : 0;
     const auto sizes = static_cast<DWORD>(flags) & page_sizes;
-    return allocate_title_physical_pages(nullptr, sizes ? sizes : mem_large_pages, count, pages);
+    const BOOL ok =
+        allocate_title_physical_pages(nullptr, sizes ? sizes : mem_large_pages, count, pages);
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (std::getenv("XV_MEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[Runtime] XMemAllocatePhysicalPages(flags=0x%llx, requested=%llu) = %d, count=%llu, error=%lu\n",
+                     static_cast<unsigned long long>(flags),
+                     static_cast<unsigned long long>(requested), ok,
+                     static_cast<unsigned long long>(count ? *count : 0), error);
+        std::fflush(stderr);
+    }
+    if (!ok)
+        SetLastError(error);
+    return ok;
 }
 BOOL WINAPI xmem_free_physical_pages(ULONG_PTR count, ULONG_PTR *pages) {
     return free_title_physical_pages(nullptr, count, pages);
 }
 // the address comes back, which a title goes on to use; null is failure either way
 void *WINAPI xmem_map_physical_pages(void *address, ULONG_PTR count, ULONG_PTR *pages) {
-    return map_title_physical_pages(address, count, mem_large_pages, PAGE_READWRITE, pages);
+    void *result = map_title_physical_pages(address, count, mem_large_pages, PAGE_READWRITE, pages);
+    const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+    if (std::getenv("XV_MEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[Runtime] XMemMapPhysicalPages(%p, count=%llu) = %p, error=%lu\n",
+                     address, static_cast<unsigned long long>(count), result, error);
+        std::fflush(stderr);
+    }
+    if (!result)
+        SetLastError(error);
+    return result;
 }
 // XMEM_WORKING_SET_STATISTICS: what a title may use, from what the host has
 struct WorkingSet {
