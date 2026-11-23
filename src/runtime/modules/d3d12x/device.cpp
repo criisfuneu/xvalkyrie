@@ -592,6 +592,7 @@ struct ShadowHeap {
     UINT host_stride;
     void *owner; // the heap the title holds
     std::uintptr_t gpu_alias = 0; // guest virtual GPU descriptor address, translated on use
+    bool owns_shadow_memory = true; // fixed-address title mapping must not be VirtualFree'd
 };
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
 // methods copy descriptors of these sizes themselves
@@ -808,8 +809,99 @@ ID3D12DescriptorHeap *host_heap(void *heap) {
                                        : static_cast<ID3D12DescriptorHeap *>(heap);
 }
 std::uint64_t STDMETHODCALLTYPE cpu_heap_start(void *self) {
+    const auto *return_address = _ReturnAddress();
+    const auto caller = detail::guest_offset(return_address);
+    const bool experimental = std::getenv("XV_SCARLETT_DESCRIPTOR_ALIAS") != nullptr;
     const std::lock_guard lock(shadow_mutex);
     const auto found = shadow_of.find(self);
+    if (experimental && console == Target::scarlett) {
+        if (static std::atomic<unsigned> logged{0}; logged++ < 8) {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett GetCPUDescriptorHandleForHeapStart: caller=image+0x%llx "
+                         "heap=%p tracked=%d\n",
+                         static_cast<unsigned long long>(caller), self,
+                         found != shadow_of.end() ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
+    if (experimental && console == Target::scarlett &&
+        caller == 0x1cf335b && found != shadow_of.end()) {
+        // Disassembled startup call chain:
+        // image+0x2478eab passes [image+0x75df188] as its requested CPU address
+        // to image+0x5cabb00 -> image+0x1cf3280 (r8 -> rbx). In image+0x1cf3358,
+        // the title calls descriptor-heap slot 9 (CPU, NOT GPU) and immediately
+        // checks the returned handle against that requested address.
+        auto heap = shadow_heaps.find(found->second);
+        const auto base = reinterpret_cast<std::uintptr_t>(
+            detail::title_image_base(return_address));
+        std::uintptr_t wanted = 0;
+        SIZE_T read = 0;
+        const bool readable =
+            base && ReadProcessMemory(GetCurrentProcess(),
+                                      reinterpret_cast<const void *>(base + 0x75df188),
+                                      &wanted, sizeof wanted, &read) &&
+            read == sizeof wanted;
+        if (heap != shadow_heaps.end() && readable && wanted) {
+            const auto size = heap->second.end - heap->second.base;
+            bool valid = wanted <= UINTPTR_MAX - size;
+            // The title maps its own physical pages first. Reuse its existing
+            // committed, writable CPU range; do not fabricate an address with
+            // no backing storage and do not release title-owned pages.
+            for (auto at = wanted; valid && at < wanted + size;) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (!VirtualQuery(reinterpret_cast<const void *>(at), &region, sizeof region) ||
+                    region.State != MEM_COMMIT ||
+                    (region.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0 ||
+                    (region.Protect & PAGE_GUARD)) {
+                    valid = false;
+                    break;
+                }
+                const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) +
+                                 region.RegionSize;
+                if (end <= at) {
+                    valid = false;
+                    break;
+                }
+                at = std::min(end, wanted + size);
+            }
+            // Avoid overlapping another descriptor heap's shadow allocation.
+            if (valid) {
+                for (const auto &[other_base, other] : shadow_heaps)
+                    if (other_base != heap->first && wanted < other.end &&
+                        other_base < wanted + size) {
+                        valid = false;
+                        break;
+                    }
+            }
+            if (valid && wanted != found->second) {
+                const auto old_base = heap->first;
+                ShadowHeap relocated = heap->second;
+                relocated.base = wanted;
+                relocated.end = wanted + size;
+                relocated.gpu_alias = 0;
+                relocated.owns_shadow_memory = false;
+                shadow_heaps.erase(heap);
+                shadow_heaps.emplace(wanted, relocated);
+                found->second = wanted;
+                VirtualFree(reinterpret_cast<void *>(old_base), 0, MEM_RELEASE);
+            }
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett descriptor CPU address: expected=%p "
+                         "returned=%p span=0x%zx valid=%d\n",
+                         reinterpret_cast<void *>(wanted),
+                         reinterpret_cast<void *>(found->second),
+                         static_cast<std::size_t>(size), valid ? 1 : 0);
+            std::fflush(stderr);
+        } else {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett descriptor CPU address: cannot read expected "
+                         "guest address (mapped=%d readable=%d wanted=%p)\n",
+                         heap != shadow_heaps.end() ? 1 : 0,
+                         readable ? 1 : 0, reinterpret_cast<void *>(wanted));
+            std::fflush(stderr);
+        }
+    }
     return found != shadow_of.end()
                ? found->second
                : static_cast<HeapProxy *>(self)->host->GetCPUDescriptorHandleForHeapStart().ptr;
@@ -895,7 +987,9 @@ ULONG STDMETHODCALLTYPE heap_release(void *self) {
         {
             const std::lock_guard lock(shadow_mutex);
             if (const auto found = shadow_of.find(proxy); found != shadow_of.end()) {
-                VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
+                const auto heap = shadow_heaps.find(found->second);
+                if (heap != shadow_heaps.end() && heap->second.owns_shadow_memory)
+                    VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
                 shadow_heaps.erase(found->second);
                 shadow_of.erase(found);
                 ++shadows_released;
