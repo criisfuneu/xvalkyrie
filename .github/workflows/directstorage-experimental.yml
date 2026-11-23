@@ -1,0 +1,28 @@
+name: Experimental Windows x64 build
+on:
+  push:
+    branches:
+      - fix/directstorage-gta6-factory-experimental
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=OFF
+      - name: Build
+        run: cmake --build build --config Release --parallel 3
+      - name: Collect executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Get-ChildItem build -Recurse -File -Filter xvboot.exe | Where-Object { $_.FullName -match '\\Release\\' } | ForEach-Object { Copy-Item $_.FullName artifact/xvboot.exe }
+          if (-not (Test-Path artifact/xvboot.exe)) { throw "xvboot.exe not found" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xvboot-directstorage-experimental
+          path: artifact/xvboot.exe
+          if-no-files-found: error
