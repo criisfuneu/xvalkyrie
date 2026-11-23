@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - xcl-fix-experimental-20261123
+      - xcl-render-fixes-20261123
   workflow_dispatch:
 
 permissions:
@@ -20,7 +21,7 @@ jobs:
         shell: pwsh
         run: |
           git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
-          git -C xcl-src checkout eaa36b62768fe1eedb87d010a19148854c9a3952
+          git -C xcl-src checkout af20b4b38e5a8003234f28091fb45e03aca68167
       - name: Apply isolated source patch
         shell: pwsh
         run: py experimental/xcl/apply_fix.py xcl-src
@@ -41,7 +42,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: xcl-windows-experimental
+          name: xcl-windows-render-experimental
           path: xcl-src/target/release/xcl.exe
           if-no-files-found: error
           retention-days: 7
