@@ -406,6 +406,16 @@ void console_vtable(void *object, std::size_t host_slots, std::size_t slots,
         block = memory + 1;
     }
     *static_cast<Slot **>(object) = block;
+    if constexpr (Kind == Family::device) {
+        if (console == Target::scarlett && std::getenv("XV_SCARLETT_FAULT_TRACE")) {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett device vtable: object=%p table=%p "
+                         "slot133=%p, extended=%d\n",
+                         object, static_cast<void *>(block), block[133],
+                         block[133] == reinterpret_cast<Slot>(&by_caller<Kind, 133>) ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
 }
 // Methods that return an 8-byte structure: the console's return it in RAX, where the
 // desktop's C++ methods write it through a hidden pointer
@@ -581,6 +591,8 @@ struct ShadowHeap {
     std::uint64_t gpu; // the host's GPU handle of the start, for a shader-visible heap
     UINT host_stride;
     void *owner; // the heap the title holds
+    std::uintptr_t gpu_alias = 0; // guest virtual GPU descriptor address, translated on use
+    bool owns_shadow_memory = true; // fixed-address title mapping must not be VirtualFree'd
 };
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
 // methods copy descriptors of these sizes themselves
@@ -612,6 +624,17 @@ const ShadowHeap *shadow_heap(std::uintptr_t address) {
         return nullptr;
     --found;
     return address < found->second.end ? &found->second : nullptr;
+}
+// Call with shadow_mutex held. A Scarlett title can request GPU descriptor addresses
+// distinct from our CPU-writable shadow heap. Translate those logical handles to
+// the corresponding shadow offset before passing handles to the host D3D12 runtime.
+std::uintptr_t shadow_gpu_address(std::uintptr_t guest_gpu) {
+    for (const auto &[base, heap] : shadow_heaps) {
+        if (heap.gpu_alias && guest_gpu >= heap.gpu_alias &&
+            guest_gpu - heap.gpu_alias < heap.end - heap.base)
+            return base + (guest_gpu - heap.gpu_alias);
+    }
+    return guest_gpu;
 }
 // the host's handle for a console one; others are the host's already
 D3D12_CPU_DESCRIPTOR_HANDLE host_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
@@ -786,8 +809,99 @@ ID3D12DescriptorHeap *host_heap(void *heap) {
                                        : static_cast<ID3D12DescriptorHeap *>(heap);
 }
 std::uint64_t STDMETHODCALLTYPE cpu_heap_start(void *self) {
+    const auto *return_address = _ReturnAddress();
+    const auto caller = detail::guest_offset(return_address);
+    const bool experimental = std::getenv("XV_SCARLETT_DESCRIPTOR_ALIAS") != nullptr;
     const std::lock_guard lock(shadow_mutex);
     const auto found = shadow_of.find(self);
+    if (experimental && console == Target::scarlett) {
+        if (static std::atomic<unsigned> logged{0}; logged++ < 8) {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett GetCPUDescriptorHandleForHeapStart: caller=image+0x%llx "
+                         "heap=%p tracked=%d\n",
+                         static_cast<unsigned long long>(caller), self,
+                         found != shadow_of.end() ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
+    if (experimental && console == Target::scarlett &&
+        caller == 0x1cf335b && found != shadow_of.end()) {
+        // Disassembled startup call chain:
+        // image+0x2478eab passes [image+0x75df188] as its requested CPU address
+        // to image+0x5cabb00 -> image+0x1cf3280 (r8 -> rbx). In image+0x1cf3358,
+        // the title calls descriptor-heap slot 9 (CPU, NOT GPU) and immediately
+        // checks the returned handle against that requested address.
+        auto heap = shadow_heaps.find(found->second);
+        const auto base = reinterpret_cast<std::uintptr_t>(
+            detail::title_image_base(return_address));
+        std::uintptr_t wanted = 0;
+        SIZE_T read = 0;
+        const bool readable =
+            base && ReadProcessMemory(GetCurrentProcess(),
+                                      reinterpret_cast<const void *>(base + 0x75df188),
+                                      &wanted, sizeof wanted, &read) &&
+            read == sizeof wanted;
+        if (heap != shadow_heaps.end() && readable && wanted) {
+            const auto size = heap->second.end - heap->second.base;
+            bool valid = wanted <= UINTPTR_MAX - size;
+            // The title maps its own physical pages first. Reuse its existing
+            // committed, writable CPU range; do not fabricate an address with
+            // no backing storage and do not release title-owned pages.
+            for (auto at = wanted; valid && at < wanted + size;) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (!VirtualQuery(reinterpret_cast<const void *>(at), &region, sizeof region) ||
+                    region.State != MEM_COMMIT ||
+                    (region.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0 ||
+                    (region.Protect & PAGE_GUARD)) {
+                    valid = false;
+                    break;
+                }
+                const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) +
+                                 region.RegionSize;
+                if (end <= at) {
+                    valid = false;
+                    break;
+                }
+                at = std::min(end, wanted + size);
+            }
+            // Avoid overlapping another descriptor heap's shadow allocation.
+            if (valid) {
+                for (const auto &[other_base, other] : shadow_heaps)
+                    if (other_base != heap->first && wanted < other.end &&
+                        other_base < wanted + size) {
+                        valid = false;
+                        break;
+                    }
+            }
+            if (valid && wanted != found->second) {
+                const auto old_base = heap->first;
+                ShadowHeap relocated = heap->second;
+                relocated.base = wanted;
+                relocated.end = wanted + size;
+                relocated.gpu_alias = 0;
+                relocated.owns_shadow_memory = false;
+                shadow_heaps.erase(heap);
+                shadow_heaps.emplace(wanted, relocated);
+                found->second = wanted;
+                VirtualFree(reinterpret_cast<void *>(old_base), 0, MEM_RELEASE);
+            }
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett descriptor CPU address: expected=%p "
+                         "returned=%p span=0x%zx valid=%d\n",
+                         reinterpret_cast<void *>(wanted),
+                         reinterpret_cast<void *>(found->second),
+                         static_cast<std::size_t>(size), valid ? 1 : 0);
+            std::fflush(stderr);
+        } else {
+            std::fprintf(stderr,
+                         "[Runtime] Scarlett descriptor CPU address: cannot read expected "
+                         "guest address (mapped=%d readable=%d wanted=%p)\n",
+                         heap != shadow_heaps.end() ? 1 : 0,
+                         readable ? 1 : 0, reinterpret_cast<void *>(wanted));
+            std::fflush(stderr);
+        }
+    }
     return found != shadow_of.end()
                ? found->second
                : static_cast<HeapProxy *>(self)->host->GetCPUDescriptorHandleForHeapStart().ptr;
@@ -797,8 +911,45 @@ std::uint64_t STDMETHODCALLTYPE gpu_heap_start(void *self) {
     {
         const std::lock_guard lock(shadow_mutex);
         const auto found = shadow_of.find(self);
-        if (found != shadow_of.end() && shadow_heaps[found->second].shader_visible)
-            return found->second;
+        if (found != shadow_of.end()) {
+            auto heap = shadow_heaps.find(found->second);
+            if (heap != shadow_heaps.end() && heap->second.shader_visible) {
+                // The title checks that its requested GPU descriptor start equals
+                // GetGPUDescriptorHandleForHeapStart. The host heap is elsewhere,
+                // so translate the guest's logical GPU handle rather than faking a
+                // resource allocation. This branch is deliberately title-specific
+                // and must be explicitly enabled for the experimental startup path.
+                if (std::getenv("XV_SCARLETT_DESCRIPTOR_ALIAS") &&
+                    detail::guest_offset(_ReturnAddress()) == 0x1cf335b &&
+                    !heap->second.gpu_alias) {
+                    constexpr std::uint64_t call_after = 0x1cf335b;
+                    constexpr std::uint64_t guest_requested_gpu = 0x75df188;
+                    const auto guest_base =
+                        reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - call_after;
+                    std::uintptr_t wanted = 0;
+                    SIZE_T bytes = 0;
+                    const bool readable =
+                        ReadProcessMemory(GetCurrentProcess(),
+                                          reinterpret_cast<const void *>(guest_base +
+                                                                         guest_requested_gpu),
+                                          &wanted, sizeof wanted, &bytes) &&
+                        bytes == sizeof wanted;
+                    if (readable && wanted &&
+                        wanted <= UINTPTR_MAX - (heap->second.end - heap->second.base)) {
+                        heap->second.gpu_alias = wanted;
+                        std::fprintf(stderr,
+                                     "[Runtime] Scarlett descriptor GPU alias: shadow=%p "
+                                     "guest=%p bytes=0x%llx\n",
+                                     reinterpret_cast<void *>(heap->second.base),
+                                     reinterpret_cast<void *>(wanted),
+                                     static_cast<unsigned long long>(
+                                         heap->second.end - heap->second.base));
+                        std::fflush(stderr);
+                    }
+                }
+                return heap->second.gpu_alias ? heap->second.gpu_alias : found->second;
+            }
+        }
     }
     return static_cast<HeapProxy *>(self)->host->GetGPUDescriptorHandleForHeapStart().ptr;
 }
@@ -836,7 +987,9 @@ ULONG STDMETHODCALLTYPE heap_release(void *self) {
         {
             const std::lock_guard lock(shadow_mutex);
             if (const auto found = shadow_of.find(proxy); found != shadow_of.end()) {
-                VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
+                const auto heap = shadow_heaps.find(found->second);
+                if (heap != shadow_heaps.end() && heap->second.owns_shadow_memory)
+                    VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
                 shadow_heaps.erase(found->second);
                 shadow_of.erase(found);
                 ++shadows_released;
@@ -1162,14 +1315,15 @@ void decode_table(const void *signature, UINT parameter, std::uint64_t gpu) {
         ranges = found->second[parameter];
     }
     ShadowHeap heap{};
+    std::uintptr_t table = gpu;
     {
         const std::lock_guard lock(shadow_mutex);
-        const auto *found = shadow_heap(gpu);
+        table = shadow_gpu_address(gpu);
+        const auto *found = shadow_heap(table);
         if (!found || !found->shader_visible)
             return;
         heap = *found;
     }
-    const std::uintptr_t table = gpu;
     for (const auto &range : ranges)
         for (UINT i = 0; i < range.count; ++i) {
             const auto at = table + std::uintptr_t{range.offset + i} * heap.stride;
@@ -1281,6 +1435,58 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, 18)(
         self, resource, desc, host_handle(handle));
     mark_host(handle);
+}
+// Scarlett GDK device slot 70: create a shader resource view from an Xbox
+// virtual address instead of a COM resource. The view layout has the standard
+// D3D12 SRV description followed by a 64-bit address at byte offset 0x28.
+void STDMETHODCALLTYPE scarlett_create_srv_at(ID3D12Device *self,
+                                              const D3D12_RESOURCE_DESC *,
+                                              const void *description, Handle handle) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    std::uint64_t guest_address = 0;
+    SIZE_T read = 0;
+    if (!description ||
+        !ReadProcessMemory(GetCurrentProcess(), description, &view, sizeof view, &read) ||
+        read != sizeof view) {
+        std::fprintf(stderr, "[Runtime] Scarlett slot 70: unreadable SRV description\n");
+        std::fflush(stderr);
+        return;
+    }
+    read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(),
+                           static_cast<const std::uint8_t *>(description) + 0x28,
+                           &guest_address, sizeof guest_address, &read) ||
+        read != sizeof guest_address) {
+        std::fprintf(stderr, "[Runtime] Scarlett slot 70: missing GPU address\n");
+        std::fflush(stderr);
+        return;
+    }
+    const auto host_gpu_address = host_address(guest_address);
+    ID3D12Resource *resource = nullptr;
+    std::uint64_t offset = 0, bytes = 0;
+    const bool found = buffer_at(host_gpu_address, resource, offset, bytes);
+    if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && found) {
+        const auto stride = view.Buffer.StructureByteStride
+                                ? view.Buffer.StructureByteStride
+                                : 4u;
+        if (offset % stride == 0)
+            view.Buffer.FirstElement += offset / stride;
+        else
+            resource = nullptr;
+    }
+    // A null-resource SRV is a valid D3D12 descriptor; do not interpret a
+    // console address as an ID3D12Resource pointer when no mapping exists.
+    create_srv(self, resource, &view, handle);
+    if (std::getenv("XV_SCARLETT_DEVICE_70_127")) {
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett slot 70: GPU=0x%llx, host=0x%llx, "
+                     "CPU=0x%llx, resource=%p, mapped=%d\n",
+                     static_cast<unsigned long long>(guest_address),
+                     static_cast<unsigned long long>(host_gpu_address),
+                     static_cast<unsigned long long>(handle.ptr),
+                     resource, found ? 1 : 0);
+        std::fflush(stderr);
+    }
 }
 void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
                                   ID3D12Resource *counter, const void *desc, Handle handle) {
@@ -1625,6 +1831,107 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
                         reinterpret_cast<const void *>(address),
                         console == Target::scarlett ? desc : nullptr);
     return result;
+}
+// Scarlett device slot 127 is the newer CreateCommittedResource form with
+// a barrier layout in place of InitialResourceState. The 10 arguments match
+// the layout seen in Xbox GDK titles and the independent XCL implementation.
+D3D12_RESOURCE_STATES scarlett_layout_state(UINT layout) {
+    switch (layout) {
+    case 1: return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    case 3: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;
+    case 6: return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    case 7: return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case 8: return D3D12_RESOURCE_STATE_COPY_DEST;
+    case 9: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    default: return D3D12_RESOURCE_STATE_COMMON;
+    }
+}
+HRESULT STDMETHODCALLTYPE scarlett_create_committed_layout(
+    ID3D12Device *self, const D3D12_HEAP_PROPERTIES *heap,
+    UINT flags, const D3D12_RESOURCE_DESC *description, UINT layout,
+    const D3D12_CLEAR_VALUE *clear, void *, UINT, const DXGI_FORMAT *,
+    REFIID iid, void **resource) {
+    if (!description || !heap || !resource)
+        return E_INVALIDARG;
+    D3D12_RESOURCE_DESC desc{};
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), description, &desc, sizeof desc,
+                           &read) || read != sizeof desc)
+        return E_INVALIDARG;
+    // ALLOW_DISPLAY is an Xbox display-target feature. Host buffers/textures
+    // can still be allocated without asking desktop D3D12 for that flag.
+    const auto host_flags = static_cast<D3D12_HEAP_FLAGS>(
+        flags & ~static_cast<UINT>(D3D12_HEAP_FLAG_ALLOW_DISPLAY));
+    const auto initial_state = scarlett_layout_state(layout);
+    const auto hr = create_committed_resource(self, heap, host_flags, &desc,
+                                              initial_state, clear, iid, resource);
+    if (std::getenv("XV_SCARLETT_DEVICE_70_127")) {
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett slot 127: layout=%u flags=0x%x "
+                     "dimension=%u width=0x%llx HRESULT=0x%08lx output=%p\n",
+                     layout, flags, static_cast<unsigned>(desc.Dimension),
+                     static_cast<unsigned long long>(desc.Width),
+                     static_cast<unsigned long>(hr),
+                     SUCCEEDED(hr) ? *resource : nullptr);
+        std::fflush(stderr);
+    }
+    return hr;
+}
+// In the later Scarlett device table the title calls slot 133 with the same
+// seven-argument layout as CreatePlacedResourceX: virtual address, resource
+// description, state, clear value, IID_ID3D12Resource, output. The exact kit
+// definition is not yet available; this translation is deliberately opt-in.
+HRESULT STDMETHODCALLTYPE create_scarlett_resource_133(ID3D12Device *self, std::uint64_t address,
+                                                      const D3D12_RESOURCE_DESC *desc,
+                                                      D3D12_RESOURCE_STATES state,
+                                                      const D3D12_CLEAR_VALUE *clear, REFIID iid,
+                                                      void **resource) {
+    if (!desc || !resource || iid != __uuidof(ID3D12Resource)) {
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett device slot 133: invalid resource request desc=%p "
+                     "output=%p\n", desc, resource);
+        std::fflush(stderr);
+        return E_INVALIDARG;
+    }
+    // The title passes ~0u for the initial state at its startup buffer creation.
+    // On the desktop this is not a valid resource-state mask. Use COMMON when
+    // creating a buffer, and leave every other state unchanged.
+    const auto host_state_133 =
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                static_cast<std::uint32_t>(state) == 0xffffffffu
+            ? D3D12_RESOURCE_STATE_COMMON
+            : state;
+    const HRESULT hr =
+        create_placed_resource_x(self, address, desc, host_state_133, clear, iid, resource);
+    // Scarlett's placed buffers use a CPU-visible Xbox virtual address; on
+    // desktop D3D12 they have another GPU VA. Translate title GPU pointers
+    // through the host buffer, including for slot 70 SRV descriptors.
+    if (SUCCEEDED(hr) && resource && *resource && address && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        address <= UINT64_MAX - desc->Width) {
+        auto *const buffer = static_cast<ID3D12Resource *>(*resource);
+        const std::uint64_t gpu = buffer->GetGPUVirtualAddress();
+        if (gpu) {
+            const std::lock_guard lock(buffer_mutex);
+            mapped_at[address] = {address + desc->Width, gpu};
+            mapped_start[buffer] = address;
+        }
+    }
+    std::fprintf(stderr,
+                 "[Runtime] Scarlett device slot 133: address=0x%llx dim=%u size=0x%llx "
+                 "state=0x%x mapped_state=0x%x HRESULT=0x%08lx resource=%p\n",
+                 static_cast<unsigned long long>(address),
+                 static_cast<unsigned>(desc->Dimension),
+                 static_cast<unsigned long long>(desc->Width),
+                 static_cast<unsigned>(state), static_cast<unsigned>(host_state_133),
+                 static_cast<unsigned long>(hr), resource ? *resource : nullptr);
+    std::fflush(stderr);
+    return hr;
 }
 // The console's GPU draws rectangle lists and quad lists (topology types 19 and 32, the
 // topologies 17 and 19). Here both are triangles: a quad list through indices of ours (see
@@ -2423,6 +2730,24 @@ std::uint64_t STDMETHODCALLTYPE list_method(void *self, std::uint64_t a, std::ui
             Index, a, b, c, d, e, detail::guest_location(_ReturnAddress()).c_str());
         std::fflush(stderr);
     }
+    // Experimental Scarlett compatibility fallback. The exact ABI and semantics of
+    // these extension slots have not been established; do not forward them to an
+    // unrelated desktop vtable entry. Opt in explicitly for startup experiments.
+    if constexpr (Index == 131 || Index == 132) {
+        static const bool allow_unknown = std::getenv("XV_SCARLETT_UNKNOWN_SLOTS") != nullptr;
+        if (allow_unknown) {
+            if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+                std::fprintf(stderr,
+                             "[Runtime] experimental Scarlett slot %zu: returning S_OK "
+                             "without GPU operation; args=%llx,%llx from %s\n",
+                             Index, static_cast<unsigned long long>(a),
+                             static_cast<unsigned long long>(b),
+                             detail::guest_location(_ReturnAddress()).c_str());
+                std::fflush(stderr);
+            }
+            return S_OK;
+        }
+    }
     const auto target = list_map[Index];
     if (target == unmapped) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
@@ -2435,8 +2760,17 @@ std::uint64_t STDMETHODCALLTYPE list_method(void *self, std::uint64_t a, std::ui
         return E_NOTIMPL;
     }
     auto *const host = host_of(self);
-    return reinterpret_cast<Raw>((*reinterpret_cast<Slot **>(host))[target])(host, a, b, c, d, e, f,
-                                                                             g, h, i, j);
+    const auto result = reinterpret_cast<Raw>((*reinterpret_cast<Slot **>(host))[target])(
+        host, a, b, c, d, e, f, g, h, i, j);
+    // Targeted diagnostics for the startup graphics path. Do not change behavior.
+    if (Index == 9) {
+        std::fprintf(stderr,
+                     "[Runtime] Direct3D 12 command list Close: result=0x%08llx from %s\n",
+                     static_cast<unsigned long long>(result),
+                     detail::guest_location(_ReturnAddress()).c_str());
+        std::fflush(stderr);
+    }
+    return result;
 }
 HRESULT STDMETHODCALLTYPE list_query(void *self, REFIID iid, void **object) {
     if (!object)
@@ -2826,7 +3160,7 @@ void bind_heap_of(void *self, std::uint64_t handle) {
     bool samplers = false;
     {
         const std::lock_guard lock(shadow_mutex);
-        const auto *heap = shadow_heap(handle);
+        const auto *heap = shadow_heap(shadow_gpu_address(handle));
         if (!heap || !heap->shader_visible)
             return;
         owner = heap->owner;
@@ -2856,8 +3190,9 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
 // the host's GPU handle for a console one, which is the descriptor's address in the shadow
 D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
     const std::lock_guard lock(shadow_mutex);
-    if (const auto *heap = shadow_heap(handle.ptr); heap && heap->shader_visible)
-        return {heap->gpu + (handle.ptr - heap->base) / heap->stride * heap->host_stride};
+    const auto address = shadow_gpu_address(handle.ptr);
+    if (const auto *heap = shadow_heap(address); heap && heap->shader_visible)
+        return {heap->gpu + (address - heap->base) / heap->stride * heap->host_stride};
     return handle;
 }
 // The root signatures and descriptor tables: the title's own descriptors in a table are read
@@ -3850,7 +4185,12 @@ void STDMETHODCALLTYPE gpu_hardware_configuration(void *, std::uint64_t *configu
     configuration[0] = static_cast<std::uint64_t>(frequency.QuadPart);
     configuration[1] = console == Target::scarlett ? 5 : 0;
 }
-constexpr std::size_t host_device_slots = 44, device_slots = 128;
+// The Scarlett GDK interface reaches at least method 133. Without these entries
+// the copied host vtable leaves an unrelated host data pointer in slot 133,
+// causing a jump to non-executable memory. Unknown extensions must fail safely
+// until their exact signatures and semantics are implemented.
+constexpr std::size_t host_device_slots = 44, device_slots = 128,
+                      scarlett_device_slots = 136;
 template <std::size_t... Index>
 std::vector<std::pair<std::size_t, Slot>> unknown_device_methods(std::index_sequence<Index...>) {
     return {{host_device_slots + Index,
@@ -4243,7 +4583,11 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (FAILED(result))
         return result;
     auto overrides =
-        unknown_device_methods(std::make_index_sequence<device_slots - host_device_slots>{});
+        unknown_device_methods(std::make_index_sequence<scarlett_device_slots - host_device_slots>{});
+    if (console == Target::durango)
+        std::erase_if(overrides, [](const auto &entry) {
+            return entry.first >= device_slots;
+        });
     overrides.push_back({0, reinterpret_cast<Slot>(&device_query)});
     overrides.push_back({13, reinterpret_cast<Slot>(&check_feature_support)});
     overrides.push_back({14, reinterpret_cast<Slot>(&create_descriptor_heap)});
@@ -4311,8 +4655,25 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({109, reinterpret_cast<Slot>(&create_committed_resource_2)});
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});
     }
+    // Separate opt-in: modern Scarlett device slots 70 and 127, whose
+    // Xbox signatures differ from the desktop D3D12 interface.
+    if (console == Target::scarlett && std::getenv("XV_SCARLETT_DEVICE_70_127")) {
+        overrides.push_back({70, reinterpret_cast<Slot>(&scarlett_create_srv_at)});
+        overrides.push_back({127, reinterpret_cast<Slot>(&scarlett_create_committed_layout)});
+        std::fprintf(stderr,
+                     "[Runtime] enabled Scarlett D3D12 device slots 70 and 127\n");
+        std::fflush(stderr);
+    }
+    // Opt-in mapping for the later Scarlett CreatePlacedResource-style ABI.
+    if (console == Target::scarlett && std::getenv("XV_SCARLETT_DEVICE_133")) {
+        overrides.push_back({133, reinterpret_cast<Slot>(&create_scarlett_resource_133)});
+        std::fprintf(stderr,
+                     "[Runtime] enabled experimental Scarlett D3D12 device slot 133 resource creation\n");
+        std::fflush(stderr);
+    }
     // all of the host's vtable, which its runtime calls past the desktop's first 44 too
-    console_vtable<Family::device>(host, 96, device_slots, overrides);
+    console_vtable<Family::device>(
+        host, 96, console == Target::scarlett ? scarlett_device_slots : device_slots, overrides);
     // through the console's QueryInterface, which knows the kits' interface IDs
     const auto queried = device_query(host, iid, device);
     host->Release();

@@ -572,6 +572,53 @@ int report_fault(EXCEPTION_POINTERS *info, bool last = true) {
                      region.AllocationBase, region.BaseAddress, region.RegionSize, region.State,
                      region.Protect);
     }
+    // Targeted diagnostics at an invalid Scarlett COM dispatch. A guest call at
+    // image+0x1e8684c invokes the function pointer in [R10 + 0x428] (slot 133).
+    // This is read-only: never skip guest instructions or fake a successful result.
+    if (std::getenv("XV_SCARLETT_FAULT_TRACE") &&
+        record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ContextRecord) {
+        const auto *context = info->ContextRecord;
+        std::uint64_t vtable = 0, slot = 0;
+        SIZE_T size_read = 0;
+        const bool have_vtable =
+            context->Rcx &&
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void *>(context->Rcx),
+                              &vtable, sizeof vtable, &size_read) &&
+            size_read == sizeof vtable;
+        size_read = 0;
+        const bool have_slot =
+            context->R10 >= 0x10000 && context->R10 <= UINT64_MAX - 0x428 &&
+            ReadProcessMemory(GetCurrentProcess(),
+                              reinterpret_cast<const void *>(context->R10 + 0x428),
+                              &slot, sizeof slot, &size_read) &&
+            size_read == sizeof slot;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (have_slot)
+            VirtualQuery(reinterpret_cast<const void *>(slot), &memory, sizeof memory);
+        std::uint64_t return_address = 0;
+        size_read = 0;
+        if (context->Rsp)
+            ReadProcessMemory(GetCurrentProcess(),
+                              reinterpret_cast<const void *>(context->Rsp),
+                              &return_address, sizeof return_address, &size_read);
+        std::fprintf(stderr,
+                     "[Runtime] Scarlett call fault: RIP=0x%llx RCX=0x%llx "
+                     "R10=0x%llx RSP=0x%llx RAX=0x%llx "
+                     "object_vtable=%s0x%llx slot133=%s0x%llx "
+                     "slot_target_state=0x%lx slot_target_protect=0x%lx "
+                     "return_address=%s0x%llx\n",
+                     static_cast<unsigned long long>(context->Rip),
+                     static_cast<unsigned long long>(context->Rcx),
+                     static_cast<unsigned long long>(context->R10),
+                     static_cast<unsigned long long>(context->Rsp),
+                     static_cast<unsigned long long>(context->Rax),
+                     have_vtable ? "" : "unreadable:", static_cast<unsigned long long>(vtable),
+                     have_slot ? "" : "unreadable:", static_cast<unsigned long long>(slot),
+                     memory.State, memory.Protect,
+                     size_read == sizeof return_address ? "" : "unreadable:",
+                     static_cast<unsigned long long>(return_address));
+        std::fflush(stderr);
+    }
     report_cxx_type(record);
     report_guest_stack(info->ContextRecord);
     report_unwound_stack(info->ContextRecord);
