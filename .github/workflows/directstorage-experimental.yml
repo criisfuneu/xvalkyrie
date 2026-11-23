@@ -1,8 +1,8 @@
-name: Experimental Windows x64 build
+name: Leonida x XValkyrie experimental hybrid
 on:
   push:
     branches:
-      - fix/directstorage-gta6-factory-experimental
+      - experiment/leonida-hybrid
   workflow_dispatch:
 permissions:
   contents: read
@@ -23,6 +23,6 @@ jobs:
           if (-not (Test-Path artifact/xvboot.exe)) { throw "xvboot.exe not found" }
       - uses: actions/upload-artifact@v4
         with:
-          name: xvboot-directstorage-experimental
+          name: xvboot-leonida-hybrid
           path: artifact/xvboot.exe
           if-no-files-found: error
