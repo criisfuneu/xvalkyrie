@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string_view>
@@ -215,7 +216,18 @@ BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD ty
             return TRUE;
         }
     }
-    return VirtualFreeEx(process, address, size, type);
+    const BOOL result = VirtualFreeEx(process, address, size, type);
+    if (std::getenv("XV_MEM_TRACE") && (type & (MEM_PRESERVE_PLACEHOLDER |
+                                                   MEM_COALESCE_PLACEHOLDERS))) {
+        const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+        std::fprintf(stderr,
+                     "[Runtime] placeholder VirtualFreeEx(%p, 0x%zx, type 0x%lx) = %d, error %lu\\n",
+                     address, static_cast<std::size_t>(size), type, result, error);
+        std::fflush(stderr);
+        if (!result)
+            SetLastError(error);
+    }
+    return result;
 }
 BOOL WINAPI virtual_free(void *address, SIZE_T size, DWORD type) {
     return virtual_free_ex(GetCurrentProcess(), address, size, type);
@@ -363,8 +375,39 @@ HRESULT WINAPI d3d_free_graphics_memory(void *address) {
 
 // xmem.dll, the GDK's names for the same memory. XMemVirtualAlloc is VirtualAlloc with
 // attributes the host has no use for; the physical page functions take no process.
-void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLONG, DWORD protect) {
-    return virtual_alloc(address, size, type, protect);
+void *WINAPI xmem_virtual_alloc(void *address, SIZE_T size, DWORD type, ULONGLONG,
+                                DWORD protect) {
+    // Experimental Scarlett placeholder translation. Ordinary VirtualAlloc strips these flags,
+    // turning the reservation into a non-placeholder and making the title's subsequent
+    // VirtualFree(..., MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) fail.
+    const bool experimental = std::getenv("XV_SCARLETT_PLACEHOLDERS") != nullptr;
+    const bool reserve_placeholder = (type & MEM_RESERVE_PLACEHOLDER) != 0;
+    const bool replace_placeholder = (type & MEM_REPLACE_PLACEHOLDER) != 0;
+    void *result = nullptr;
+    if (experimental && (reserve_placeholder || replace_placeholder)) {
+        const DWORD host_type = reserve_placeholder
+                                    ? MEM_RESERVE | MEM_RESERVE_PLACEHOLDER
+                                    : MEM_RESERVE | MEM_REPLACE_PLACEHOLDER;
+        // Xbox-specific physical/large-page bits cannot be blindly passed to the host API.
+        // This tries a private placeholder replacement; it is NOT physical Xbox page mapping.
+        result = VirtualAlloc2(GetCurrentProcess(), address, size, host_type,
+                               reserve_placeholder ? PAGE_NOACCESS : (protect & protections),
+                               nullptr, 0);
+    } else {
+        result = virtual_alloc(address, size, type, protect);
+    }
+    const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+    if (std::getenv("XV_MEM_TRACE") &&
+        (reserve_placeholder || replace_placeholder || !result)) {
+        std::fprintf(stderr,
+                     "[Runtime] XMemVirtualAlloc(%p, 0x%zx, type 0x%lx, protect 0x%lx) = %p, error %lu, experimental=%d\\n",
+                     address, static_cast<std::size_t>(size), type, protect, result,
+                     error, experimental ? 1 : 0);
+        std::fflush(stderr);
+    }
+    if (!result)
+        SetLastError(error);
+    return result;
 }
 BOOL WINAPI xmem_allocate_physical_pages(ULONGLONG flags, ULONG_PTR *count, ULONG_PTR *pages) {
     const auto sizes = static_cast<DWORD>(flags) & page_sizes;
