@@ -202,3 +202,61 @@ TEST_CASE("a pixel DPP8 move can rearrange the four lanes of each quad") {
     CHECK_FALSE(pixel_move(0x7e3002ea, 0x9f50d114, why, needs_sm6)); // fetch inactive lanes
     CHECK_FALSE(needs_sm6);
 }
+
+TEST_CASE("native instruction extraction recognizes an XBCH envelope with DXIL-relative offsets") {
+    // Synthetic container; no title data. One FSSM instruction ends the program.
+    constexpr std::size_t region = 0x140;
+    std::vector<std::uint8_t> fssm(region + 0x2c);
+    const auto put = [](std::vector<std::uint8_t> &v, std::size_t at, std::uint32_t value) {
+        std::memcpy(v.data() + at, &value, sizeof value);
+    };
+    std::memcpy(fssm.data(), "FSSM", 4);
+    put(fssm, 0xc0, region);
+    put(fssm, 0xc8, 0x2c);
+    put(fssm, region + 0x28, 0xbf810000);
+
+    // RFC 1950/1951, single final uncompressed block.
+    const auto len = static_cast<std::uint16_t>(fssm.size());
+    const auto nlen = static_cast<std::uint16_t>(~len);
+    std::vector<std::uint8_t> zlib{0x78, 0x01, 0x01, static_cast<std::uint8_t>(len),
+                                  static_cast<std::uint8_t>(len >> 8),
+                                  static_cast<std::uint8_t>(nlen),
+                                  static_cast<std::uint8_t>(nlen >> 8)};
+    zlib.insert(zlib.end(), fssm.begin(), fssm.end());
+    std::uint32_t a = 1, b = 0;
+    for (auto byte : fssm) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    const auto adler = (b << 16) | a;
+    for (int shift = 24; shift >= 0; shift -= 8)
+        zlib.push_back(static_cast<std::uint8_t>(adler >> shift));
+
+    constexpr std::size_t part_offset = 36, header = part_offset + 8;
+    constexpr std::size_t table = 36, section = 48;
+    std::vector<std::uint8_t> container(header + section + 24 + zlib.size());
+    std::memcpy(container.data(), "DXBC", 4);
+    put(container, 24, static_cast<std::uint32_t>(container.size()));
+    put(container, 28, 1);
+    put(container, 32, part_offset);
+    std::memcpy(container.data() + part_offset, "DXIL", 4);
+    put(container, part_offset + 4, static_cast<std::uint32_t>(container.size() - header));
+    std::memcpy(container.data() + header + 24, "XDAT", 4);
+    put(container, header + 28, 1);
+    put(container, header + 32, table);
+    put(container, header + table, 0x0d);
+    put(container, header + table + 4, section);
+    put(container, header + table + 8, static_cast<std::uint32_t>(24 + zlib.size()));
+    std::memcpy(container.data() + header + section, "XBCH", 4);
+    put(container, header + section + 4, 3);
+    put(container, header + section + 8, static_cast<std::uint32_t>(zlib.size()));
+    put(container, header + section + 16, static_cast<std::uint32_t>(fssm.size()));
+    std::memcpy(container.data() + header + section + 24, zlib.data(), zlib.size());
+    const auto code = xv::runtime::modules::console_shader_code(container);
+    REQUIRE(code.size() == 1);
+    CHECK(code.front() == 0xbf810000);
+
+    // A declared compressed size outside its envelope must not be accepted.
+    put(container, header + section + 8, 0xffffffffu);
+    CHECK(xv::runtime::modules::console_shader_code(container).empty());
+}
