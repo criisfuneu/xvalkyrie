@@ -1,0 +1,65 @@
+name: VIctory World Shader + Root Views (Windows)
+on:
+  push:
+    branches:
+      - victory-world-rdna4-20261124
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  victory-world:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout launcher
+        uses: actions/checkout@v4
+      - name: Compose latest VIctory and root-view shader improvements
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/Marvisak/VIctory.git victory-src
+          if ($LASTEXITCODE -ne 0) { throw 'Clone VIctory failed' }
+          git -C victory-src checkout ffe310eb2098e52169f4c44db5ffdabf43a72622
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned main checkout failed' }
+          # PR #709 includes stacked PR #294: 4 commits total.
+          git -C victory-src fetch origin pull/709/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR 709 fetch failed' }
+          $commits = @(git -C victory-src rev-list --reverse ffe310eb2098e52169f4c44db5ffdabf43a72622..FETCH_HEAD)
+          if ($commits.Count -ne 4) { throw "Expected 4 stacked PR294/709 commits, got $($commits.Count)" }
+          foreach ($sha in $commits) {
+            git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $sha
+            if ($LASTEXITCODE -ne 0) {
+              $conflicts = @(git -C victory-src diff --name-only --diff-filter=U)
+              throw "Cannot cherry-pick $sha cleanly. Conflicts: $($conflicts -join ', '). Needs compatibility adaptation."
+            }
+          }
+          $combined = (git -C victory-src rev-parse HEAD).Trim()
+          "VIctory upstream main ffe310eb2098e52169f4c44db5ffdabf43a72622" | Set-Content provenance.txt
+          "Stacked PR #294 and #709 root SRV/UAV correctness, 4 commits" | Add-Content provenance.txt
+          "Combined source commit $combined" | Add-Content provenance.txt
+          "VIctory GPL-3.0-or-later; XCL stays separate" | Add-Content provenance.txt
+      - name: Build release
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo build --release --locked -p victory
+      - name: Test root view and shader crates
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo test --locked -p victory-shader -p victory-gpu --lib -- --test-threads=4
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item victory-src/target/release/victory.exe output/
+          Copy-Item victory-src/victory.example.toml output/
+          Copy-Item victory-src/README.md output/UPSTREAM_README.md
+          Copy-Item victory-src/LICENSE output/
+          Copy-Item experimental/victory/* output/
+          Copy-Item provenance.txt output/
+          & "output/victory.exe" --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-world-rdna4-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
