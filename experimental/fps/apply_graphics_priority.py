@@ -107,6 +107,13 @@ count = source.count(needle)
 if count != 2:
     raise RuntimeError(f'Expected exactly 2 async enqueue sites, got {count}')
 source = source.replace(needle, 'enqueue_priority(p);')
+# Newer upstream also directly enqueues a cloned pipeline in a unit-test helper
+# near the end of the module. Preserve the same queue behavior there.
+test_send = 'let _ = queue().lock().unwrap().send(p.clone());'
+if source.count(test_send) != 1:
+    raise RuntimeError(f'Expected one extra test enqueue, got {source.count(test_send)}')
+source = source.replace(test_send, 'enqueue_priority(p.clone());')
+
 # A demand bind can also re-queue a previously-preloaded pipeline using a clone.
 replace_once('let _ = queue().lock().unwrap().send(p.clone());', 'enqueue_priority(p.clone());')
 
