@@ -4,6 +4,7 @@
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
 #include "runtime/modules/placement.hpp"
+#include "runtime/modules/system.hpp"
 #include "runtime/modules/xg.hpp"
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <d3d12.h>
+#include <dxcapi.h>
 #include <deque>
 #include <dxgi1_6.h>
 #include <intrin.h>
@@ -24,6 +26,7 @@
 #include <utility>
 #include <vector>
 #include <wrl/implements.h>
+#include <wrl/client.h>
 
 // d3d12_x.dll and d3d12_xs.dll on the host's Direct3D 12. Both consoles have the same
 // interfaces up to the methods each added last; `console` says which the title was built for.
@@ -2150,6 +2153,79 @@ ID3D12RootSignature *shader_root_signature(ID3D12Device *self, bool drawing,
     }
     return nullptr;
 }
+// Validate the compute container independently of the vendor driver. A native
+// DXIL chunk is not necessarily legal desktop DXIL merely because it has bitcode.
+HRESULT validate_compute_shader(const D3D12_SHADER_BYTECODE &code) {
+    const auto bytes = shader_bytes(code);
+    const auto u32 = [&](std::size_t at) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data() + at, sizeof value);
+        return value;
+    };
+    if (bytes.size() < 32 || bytes.size() > UINT32_MAX ||
+        std::memcmp(bytes.data(), "DXBC", 4) != 0 ||
+        u32(24) != bytes.size() || u32(28) > (bytes.size() - 32) / 4) {
+        std::fprintf(stderr, "[Runtime] malformed compute shader container\n");
+        std::fflush(stderr);
+        return E_INVALIDARG;
+    }
+    bool dxil = false, legacy = false;
+    const std::size_t table_end = 32 + std::size_t{u32(28)} * 4;
+    for (std::size_t i = 0; i < u32(28); ++i) {
+        const std::size_t offset = u32(32 + 4 * i);
+        if (offset < table_end || offset > bytes.size() - 8 ||
+            u32(offset + 4) > bytes.size() - offset - 8) {
+            std::fprintf(stderr, "[Runtime] malformed compute shader chunk %zu\n", i);
+            std::fflush(stderr);
+            return E_INVALIDARG;
+        }
+        dxil |= std::memcmp(bytes.data() + offset, "DXIL", 4) == 0;
+        legacy |= std::memcmp(bytes.data() + offset, "SHEX", 4) == 0 ||
+                  std::memcmp(bytes.data() + offset, "SHDR", 4) == 0;
+    }
+    std::fprintf(stderr, "[Runtime] compute shader digest ");
+    for (std::size_t i = 4; i < 20; ++i)
+        std::fprintf(stderr, "%02x", static_cast<unsigned>(bytes[i]));
+    std::fprintf(stderr, " format %s size %zu\n", dxil ? "DXIL" : legacy ? "DXBC" : "unknown",
+                 bytes.size());
+    std::fflush(stderr);
+    if (!dxil)
+        return legacy ? S_OK : E_INVALIDARG;
+    if (!modules::shader_has_dxil(bytes))
+        return E_INVALIDARG;
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IDxcUtils> utils;
+    ComPtr<IDxcValidator> validator;
+    if (FAILED(modules::host_dxc_create_instance(CLSID_DxcUtils, IID_PPV_ARGS(&utils))) ||
+        FAILED(modules::host_dxc_create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&validator)))) {
+        std::fprintf(stderr, "[Runtime] DXIL validator unavailable; refusing unvalidated compute DXIL\n");
+        std::fflush(stderr);
+        return E_NOINTERFACE;
+    }
+    ComPtr<IDxcBlobEncoding> blob;
+    auto hr = utils->CreateBlob(bytes.data(), static_cast<UINT32>(bytes.size()), DXC_CP_ACP, &blob);
+    if (FAILED(hr))
+        return hr;
+    ComPtr<IDxcOperationResult> result;
+    hr = validator->Validate(blob.Get(), DxcValidatorFlags_Default, &result);
+    HRESULT status = E_FAIL;
+    if (SUCCEEDED(hr) && result)
+        hr = result->GetStatus(&status);
+    if (FAILED(hr))
+        status = hr;
+    std::fprintf(stderr, "[Runtime] independent DXIL compute validation: 0x%08lx\n",
+                 static_cast<unsigned long>(status));
+    if (FAILED(status) && result) {
+        ComPtr<IDxcBlobEncoding> errors;
+        if (SUCCEEDED(result->GetErrorBuffer(&errors)) && errors && errors->GetBufferPointer()) {
+            std::fprintf(stderr, "[Runtime] DXIL validator: %.*s\n",
+                         static_cast<int>(std::min<SIZE_T>(errors->GetBufferSize(), 8192)),
+                         static_cast<const char *>(errors->GetBufferPointer()));
+        }
+    }
+    std::fflush(stderr);
+    return status;
+}
 // Keep a flushed, thread-correlated trace immediately around host PSO calls.
 // A driver exception can terminate execution before an HRESULT is returned.
 struct HostPsoTrace {
@@ -2472,6 +2548,22 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
         if (state)
             *state = nullptr;
         return E_INVALIDARG;
+    }
+    if (desc) {
+        std::fprintf(stderr, "[Runtime] compute input: original %zu bytes, host %zu bytes, translated %s, root data %zu bytes\n",
+                     static_cast<std::size_t>(desc->CS.BytecodeLength),
+                     static_cast<std::size_t>(host.CS.BytecodeLength),
+                     host.CS.pShaderBytecode != desc->CS.pShaderBytecode ? "yes" : "no",
+                     signature_part(host.pRootSignature).size());
+        std::fflush(stderr);
+        const auto valid = validate_compute_shader(host.CS);
+        if (FAILED(valid)) {
+            if (from_shader)
+                from_shader->Release();
+            if (state)
+                *state = nullptr;
+            return valid;
+        }
     }
     HostPsoTrace trace("compute", host.pRootSignature, host.CS.BytecodeLength);
     auto result = trace.end(original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state));
