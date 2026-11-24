@@ -2150,6 +2150,28 @@ ID3D12RootSignature *shader_root_signature(ID3D12Device *self, bool drawing,
     }
     return nullptr;
 }
+// Keep a flushed, thread-correlated trace immediately around host PSO calls.
+// A driver exception can terminate execution before an HRESULT is returned.
+struct HostPsoTrace {
+    const char *kind;
+    unsigned long thread = GetCurrentThreadId();
+    unsigned long long id;
+    static inline std::atomic<unsigned long long> next{0};
+    HostPsoTrace(const char *name, const void *root, SIZE_T a, SIZE_T b = 0)
+        : kind(name), id(++next) {
+        std::fprintf(stderr,
+                     "[Runtime] host PSO begin #%llu thread %lu %s root %p sizes %zu/%zu\n",
+                     id, thread, kind, root, static_cast<std::size_t>(a),
+                     static_cast<std::size_t>(b));
+        std::fflush(stderr);
+    }
+    HRESULT end(HRESULT result) const {
+        std::fprintf(stderr, "[Runtime] host PSO end #%llu thread %lu %s: 0x%08lx\n",
+                     id, thread, kind, static_cast<unsigned long>(result));
+        std::fflush(stderr);
+        return result;
+    }
+};
 // What each graphics pipeline was made from, as the host was given it: the console derives
 // a pipeline from another with some of its state changed, and the host makes one whole.
 // Shaders are kept once each, however many pipelines use them.
@@ -2231,7 +2253,9 @@ HRESULT STDMETHODCALLTYPE create_derived_graphics_pipeline(ID3D12Device *self,
             desc.BlendState = states[i].blend;
         else if (states[i].type == 3)
             desc.SampleMask = states[i].sample_mask;
-    const auto result = original<Create>(self, 10)(self, &desc, iid, state);
+    HostPsoTrace trace("derived graphics", desc.pRootSignature, desc.VS.BytecodeLength,
+                       desc.PS.BytecodeLength);
+    const auto result = trace.end(original<Create>(self, 10)(self, &desc, iid, state));
     if (SUCCEEDED(result) && *state)
         keep_pipeline(*state, desc);
     else {
@@ -2276,6 +2300,12 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        if (host.CachedPSO.CachedBlobSizeInBytes) {
+            std::fprintf(stderr, "[Runtime] discarding foreign graphics PSO cache (%zu bytes)\n",
+                         static_cast<std::size_t>(host.CachedPSO.CachedBlobSizeInBytes));
+            std::fflush(stderr);
+        }
+        host.CachedPSO = {};
         // The console's R10G10B10_SNORM_A2_UNORM (189), what packed normals are in, is no
         // vertex format of the host's: its bits are read unsigned there, and a vertex shader
         // made here makes them signed again
@@ -2320,13 +2350,17 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     const bool rectangles = desc && desc->PrimitiveTopologyType == rectangle_type;
     const auto cull = host.RasterizerState.CullMode;
     const bool cornered = rectangles && rectangle_pipeline(host);
-    auto result = original<Create>(self, 10)(self, desc ? &host : nullptr, iid, state);
+    HostPsoTrace trace("graphics", host.pRootSignature, host.VS.BytecodeLength,
+                       host.PS.BytecodeLength);
+    auto result = trace.end(original<Create>(self, 10)(self, desc ? &host : nullptr, iid, state));
     // the host's compiler may lay the shader's inputs out another way than the title's
     // vertex shader its outputs: the pipeline is then made without it
     if (FAILED(result) && cornered) {
         host.GS = {};
         host.RasterizerState.CullMode = cull;
-        result = original<Create>(self, 10)(self, &host, iid, state);
+        HostPsoTrace retry("graphics retry", host.pRootSignature, host.VS.BytecodeLength,
+                           host.PS.BytecodeLength);
+        result = retry.end(original<Create>(self, 10)(self, &host, iid, state));
     }
     if (rectangles && (!cornered || !host.GS.pShaderBytecode))
         report_half_rectangles();
@@ -2408,6 +2442,12 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        if (host.CachedPSO.CachedBlobSizeInBytes) {
+            std::fprintf(stderr, "[Runtime] discarding foreign compute PSO cache (%zu bytes)\n",
+                         static_cast<std::size_t>(host.CachedPSO.CachedBlobSizeInBytes));
+            std::fflush(stderr);
+        }
+        host.CachedPSO = {};
         if (host_bytecode(modules::ShaderStage::compute, host.CS, modules::HostShaderModel::sm5, {},
                           host.pRootSignature) &&
             !host.pRootSignature)
@@ -2433,10 +2473,13 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
             *state = nullptr;
         return E_INVALIDARG;
     }
-    auto result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
+    HostPsoTrace trace("compute", host.pRootSignature, host.CS.BytecodeLength);
+    auto result = trace.end(original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state));
     if (FAILED(result) && !emptied && desc && host.CS.pShaderBytecode == desc->CS.pShaderBytecode &&
-        empty())
-        result = original<Create>(self, 11)(self, &host, iid, state);
+        empty()) {
+        HostPsoTrace retry("compute retry", host.pRootSignature, host.CS.BytecodeLength);
+        result = retry.end(original<Create>(self, 11)(self, &host, iid, state));
+    }
     if (emptied) {
         std::fprintf(stderr,
                      "[Runtime] a compute shader of %zu bytes that the host's driver cannot "
@@ -4673,6 +4716,19 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             }
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE && size >= 16)
                 signature_at = stream.size() - size + 8;
+            // Cached pipeline binaries are driver- and adapter-specific. The desktop
+            // must compile from the translated pipeline, not load the console cache.
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO &&
+                size >= 8 + sizeof(D3D12_CACHED_PIPELINE_STATE)) {
+                D3D12_CACHED_PIPELINE_STATE cache{};
+                std::memcpy(&cache, stream.data() + value_at, sizeof cache);
+                if (cache.CachedBlobSizeInBytes) {
+                    std::fprintf(stderr, "[Runtime] discarding foreign stream PSO cache (%zu bytes)\n",
+                                 static_cast<std::size_t>(cache.CachedBlobSizeInBytes));
+                    std::fflush(stderr);
+                }
+                std::memset(stream.data() + value_at, 0, sizeof cache);
+            }
             // the console's flags
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS && size >= 8)
                 std::memset(stream.data() + stream.size() - size + 4, 0, 4);
@@ -4716,7 +4772,8 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
         host = {stream.size(), stream.data()};
         desc = &host;
     }
-    const auto result = original<Create>(self, 47)(self, desc, iid, state);
+    HostPsoTrace trace("stream", from_shader, desc ? desc->SizeInBytes : 0);
+    const auto result = trace.end(original<Create>(self, 47)(self, desc, iid, state));
     if (from_shader)
         from_shader->Release();
     if (FAILED(result)) {
