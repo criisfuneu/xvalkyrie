@@ -80,10 +80,6 @@ jobs:
         shell: pwsh
         working-directory: victory-src
         run: cargo build --locked --profile diag -p victory --features diagnostics
-
-        shell: pwsh
-        working-directory: victory-src
-        run: cargo build --release --locked -p victory
       - name: Test GPU memory and shaders
         shell: pwsh
         working-directory: victory-src
