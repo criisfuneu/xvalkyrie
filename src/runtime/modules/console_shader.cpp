@@ -246,11 +246,52 @@ std::vector<std::uint8_t> code_container(Bytes container) {
     if (dxil.size() < xdat + 16 || std::memcmp(dxil.data() + xdat, "XDAT", 4))
         return {};
     const auto block = dxil.subspan(xdat);
+    // Accept the versioned XBCH envelope as well as the original bare zlib section.
+    // Some XDAT tables use offsets from the DXIL program header rather than XDAT.
+    const auto unpack_fssm = [](Bytes section) {
+        std::vector<std::uint8_t> out;
+        if (section.size() >= 24 && !std::memcmp(section.data(), "XBCH", 4)) {
+            if (word(section, 4) != 3)
+                return out;
+            const auto packed_size = word(section, 8), unpacked_size = word(section, 16);
+            if (!packed_size || packed_size > section.size() - 24 ||
+                unpacked_size > (64u << 20))
+                return out;
+            if (!Inflate(section.subspan(24, packed_size)).run(out) ||
+                out.size() != unpacked_size)
+                return std::vector<std::uint8_t>{};
+        } else if (!Inflate(section).run(out)) {
+            return std::vector<std::uint8_t>{};
+        }
+        if (out.size() < 16 || std::memcmp(out.data(), "FSSM", 4))
+            return std::vector<std::uint8_t>{};
+        return out;
+    };
+    // Header-relative table location, when explicitly specified by the container.
+    const std::size_t count = word(block, 4), table = word(block, 8);
+    if (count && count <= 256 && table >= xdat + 12 && table <= dxil.size() &&
+        count <= (dxil.size() - table) / 12) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t at = table + i * 12;
+            const auto type = word(dxil, at), offset = word(dxil, at + 4),
+                       size = word(dxil, at + 8);
+            if (type != 0x0d || offset > dxil.size() || size > dxil.size() - offset)
+                continue;
+            if (auto out = unpack_fssm(dxil.subspan(offset, size)); !out.empty())
+                return out;
+        }
+    }
     for (std::size_t entry = 12; entry + 12 <= std::min<std::size_t>(block.size(), 12 + 16 * 12);
          entry += 12) {
         const auto type = word(block, entry), offset = word(block, entry + 4),
                    size = word(block, entry + 8);
-        if (type > 0xff || offset > block.size() || size > block.size() - offset)
+        if (type > 0xff)
+            break;
+        if (type == 0x0d && offset <= dxil.size() && size <= dxil.size() - offset) {
+            if (auto out = unpack_fssm(dxil.subspan(offset, size)); !out.empty())
+                return out;
+        }
+        if (offset > block.size() || size > block.size() - offset)
             break;
         // that one's place is counted from the start of the part
         if (!type && size > 8 && offset <= dxil.size() && size <= dxil.size() - offset) {
@@ -264,11 +305,8 @@ std::vector<std::uint8_t> code_container(Bytes container) {
             break;
         if (type != 0x0d)
             continue;
-        std::vector<std::uint8_t> out;
-        if (Inflate(block.subspan(offset, size)).run(out) && out.size() >= 16 &&
-            !std::memcmp(out.data(), "FSSM", 4))
+        if (auto out = unpack_fssm(block.subspan(offset, size)); !out.empty())
             return out;
-        return {};
     }
     return {};
 }
@@ -828,6 +866,18 @@ bool shader_has_dxil(Bytes container) {
 std::vector<std::uint32_t> console_shader_code(Bytes container) {
     const auto file = code_container(container);
     const Bytes bytes(file);
+    if (bytes.size() >= 0x140 && !std::memcmp(bytes.data(), "FSSM", 4)) {
+        // Use the same region and instruction start as the FSSM translator.
+        const std::size_t region = word(bytes, 0xc0), size = word(bytes, 0xc8);
+        if (region <= bytes.size() && size <= bytes.size() - region && size >= 0x2c &&
+            !(size % 4)) {
+            std::vector<std::uint32_t> code;
+            for (std::size_t at = region + 0x28; at + 4 <= region + size; at += 4)
+                code.push_back(word(bytes, at));
+            return code;
+        }
+        return {};
+    }
     // The header has one slot per kind of shader, unused ones filled with a marker; the one
     // in use leads to a record that has where the code is and how long, padding included.
     std::uint32_t record = 0;
