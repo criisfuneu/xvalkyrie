@@ -216,7 +216,13 @@ $start.Add_Click({
             if ($capture.Checked) { $psi.EnvironmentVariables['XCL_FRAME_DUMP'] = '120' }
             else { [void]$psi.EnvironmentVariables.Remove('XCL_FRAME_DUMP') }
         } else {
-            $psi.Arguments = 'run "' + $gameExe + '" --execute'
+            $runner = Join-Path $PSScriptRoot 'Run-Victory.ps1'
+            if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+                throw 'Script de diagnostico Run-Victory.ps1 nao encontrado ao lado do launcher.'
+            }
+            $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $psi.WorkingDirectory = $PSScriptRoot
+            $psi.Arguments = '-NoProfile -NoExit -ExecutionPolicy Bypass -File "' + $runner + '" -VictoryExe "' + $binary + '" -GameExe "' + $gameExe + '" -GameDir "' + $gameDir + '"'
             $psi.EnvironmentVariables['VICTORY_GAME_DIR'] = $gameDir
         }
         $process = [System.Diagnostics.Process]::Start($psi)
