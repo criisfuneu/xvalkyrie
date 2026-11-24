@@ -1681,22 +1681,20 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap(ID3D12Device *self,
         changed.Flags &= ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         desc = &changed;
     }
-    // The host shows its shaders a million descriptors at most: a larger heap is made that
-    // large, and what the title keeps past that is not seen
-    constexpr UINT host_visible_limit = 1'000'000;
-    if (desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
-        desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE &&
-        desc->NumDescriptors > host_visible_limit) {
-        std::fprintf(stderr,
-                     "[Runtime] a descriptor heap of %u descriptors for shaders is made with "
-                     "%u, the host's limit\n",
-                     desc->NumDescriptors, host_visible_limit);
-        std::fflush(stderr);
-        changed = *desc;
-        changed.NumDescriptors = host_visible_limit;
-        desc = &changed;
-    }
+    // A Tier 3 device can support more than one million shader-visible descriptors.
+    // Never expose a smaller host heap as a larger guest heap: handles beyond its end
+    // would not refer to valid host descriptors. Let the real host runtime decide.
+    const bool large_visible_heap =
+        desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+        desc->NumDescriptors > 1'000'000;
     const auto result = original<Create>(self, 14)(self, desc, iid, heap);
+    if (large_visible_heap) {
+        std::fprintf(stderr,
+                     "[Runtime] full shader-visible descriptor heap of %u descriptors: 0x%08lx\n",
+                     desc->NumDescriptors, static_cast<unsigned long>(result));
+        std::fflush(stderr);
+    }
     if (FAILED(result) && desc) {
         std::fprintf(stderr,
                      "[Runtime] CreateDescriptorHeap type %d, %u descriptors, flags 0x%x, node "
@@ -2078,6 +2076,20 @@ bool host_bytecode(modules::ShaderStage stage, D3D12_SHADER_BYTECODE &code,
     return true;
 }
 
+// A failed console shader translation must not send console machine code to a desktop driver.
+// Empty optional stages are legitimate, but mismatched pointers/sizes are not.
+bool host_shader_ready(const char *stage, const D3D12_SHADER_BYTECODE &code) {
+    if (!code.pShaderBytecode && !code.BytecodeLength)
+        return true;
+    if (!code.pShaderBytecode || !code.BytecodeLength ||
+        modules::console_only_shader(shader_bytes(code))) {
+        std::fprintf(stderr, "[Runtime] rejected incompatible %s shader before host PSO creation (%zu bytes)\n",
+                     stage, static_cast<std::size_t>(code.BytecodeLength));
+        std::fflush(stderr);
+        return false;
+    }
+    return true;
+}
 bool host_graphics_pair(ID3D12Device *device, D3D12_SHADER_BYTECODE &vs, D3D12_SHADER_BYTECODE &ps,
                         bool allow_sm6, std::span<const modules::PackedInput> packed = {},
                         const void *signature = nullptr) {
@@ -2294,6 +2306,17 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
             host.pRootSignature = from_shader =
                 shader_root_signature(self, true, {desc->VS, desc->PS, desc->GS});
     }
+    if (desc && (!host_shader_ready("vertex", host.VS) ||
+                 !host_shader_ready("pixel", host.PS) ||
+                 !host_shader_ready("geometry", host.GS) ||
+                 !host_shader_ready("hull", host.HS) ||
+                 !host_shader_ready("domain", host.DS))) {
+        if (from_shader)
+            from_shader->Release();
+        if (state)
+            *state = nullptr;
+        return E_INVALIDARG;
+    }
     const bool rectangles = desc && desc->PrimitiveTopologyType == rectangle_type;
     const auto cull = host.RasterizerState.CullMode;
     const bool cornered = rectangles && rectangle_pipeline(host);
@@ -2403,6 +2426,13 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     };
     if (desc && ends_host_driver(desc->CS))
         empty();
+    if (desc && !host_shader_ready("compute", host.CS)) {
+        if (from_shader)
+            from_shader->Release();
+        if (state)
+            *state = nullptr;
+        return E_INVALIDARG;
+    }
     auto result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
     if (FAILED(result) && !emptied && desc && host.CS.pShaderBytecode == desc->CS.pShaderBytecode &&
         empty())
@@ -2720,7 +2750,9 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
     D3D12_HEAP_PROPERTIES mappable{};
     const auto *const asked = heap;
     if (console == Target::scarlett && heap && desc && heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
-        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+        !(host_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+        !(state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
         mappable = {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
                     D3D12_MEMORY_POOL_L0, heap->CreationNodeMask, heap->VisibleNodeMask};
         heap = &mappable;
@@ -4589,11 +4621,20 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                 if (static std::atomic<bool> shown{false}; !shown.exchange(true))
                     std::fprintf(stderr,
                                  "[Runtime] CreatePipelineState: console subobject %u, which "
-                                 "ends what the host is given of the stream\n",
+                                 "is not supported by the host stream translator\n",
                                  type);
-                break;
+                if (state)
+                    *state = nullptr;
+                return E_NOTIMPL;
             }
-            const auto size = std::min(sizes[type], desc->SizeInBytes - at);
+            const auto size = sizes[type];
+            if (size > desc->SizeInBytes - at) {
+                std::fprintf(stderr, "[Runtime] truncated pipeline subobject %u at %zu\n", type, at);
+                std::fflush(stderr);
+                if (state)
+                    *state = nullptr;
+                return E_INVALIDARG;
+            }
             stream.insert(stream.end(), bytes + at, bytes + at + size);
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY && size >= 8) {
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE topology;
@@ -4624,6 +4665,11 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                 D3D12_SHADER_BYTECODE other{};
                 std::memcpy(&other, stream.data() + value_at, sizeof other);
                 simple_graphics &= !other.pShaderBytecode;
+                if (!host_shader_ready("additional stream stage", other)) {
+                    if (state)
+                        *state = nullptr;
+                    return E_INVALIDARG;
+                }
             }
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE && size >= 16)
                 signature_at = stream.size() - size + 8;
@@ -4631,6 +4677,13 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS && size >= 8)
                 std::memset(stream.data() + stream.size() - size + 4, 0, 4);
             at += size;
+        }
+        if (stream.size() != desc->SizeInBytes) {
+            std::fprintf(stderr, "[Runtime] incomplete pipeline state stream\n");
+            std::fflush(stderr);
+            if (state)
+                *state = nullptr;
+            return E_INVALIDARG;
         }
         D3D12_SHADER_BYTECODE vertex = shaders[0], pixel = shaders[1], compute = shaders[2];
         void *signature = nullptr;
@@ -4640,6 +4693,13 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                                   {}, signature);
         made |= host_bytecode(modules::ShaderStage::compute, compute, modules::HostShaderModel::sm5,
                               {}, signature);
+        if (!host_shader_ready("stream vertex", vertex) ||
+            !host_shader_ready("stream pixel", pixel) ||
+            !host_shader_ready("stream compute", compute)) {
+            if (state)
+                *state = nullptr;
+            return E_INVALIDARG;
+        }
         const D3D12_SHADER_BYTECODE translated[] = {vertex, pixel, compute};
         for (std::size_t index = 0; index < std::size(shader_at); ++index)
             if (shader_at[index])
