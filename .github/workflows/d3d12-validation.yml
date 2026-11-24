@@ -1,0 +1,37 @@
+name: D3D12 validation Windows build
+on:
+  push:
+    branches: ["fix/d3d12-validation"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel 3
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
+          $exe = Get-ChildItem build -Recurse -File -Filter xvalkyrie.exe | Select-Object -First 1
+          if (-not $exe) { throw 'Missing xvalkyrie.exe' }
+          Copy-Item "$($exe.Directory.FullName)\*" dist -Recurse -Force
+          if (-not (Test-Path dist/xvboot.exe)) { throw 'Missing xvboot.exe' }
+          Copy-Item LICENSE,THIRD-PARTY.md,README.md dist
+          Get-ChildItem dist -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xvalkyrie-d3d12-validation-windows-x64
+          path: dist/
+          if-no-files-found: error
