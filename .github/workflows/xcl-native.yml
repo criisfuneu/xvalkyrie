@@ -1,7 +1,7 @@
-name: XCL integrated main plus Mesh PSO Windows x64
+name: XCL mesh plus watchdog Windows x64
 on:
   push:
-    branches: ["build/xcl-mesh-integrated"]
+    branches: ["build/xcl-mesh-watchdog-20261124"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,6 +43,18 @@ jobs:
           }
           git diff --stat 9e3831e1f570d3646e53ab753b19ec07eb8f1485 HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Cannot verify integration' }
+      - name: Restore pinned watchdog hold without skipping dispatches
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags --depth=2 https://github.com/imnicho/xcl.git 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned watchdog correction failed' }
+          git cherry-pick -x 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          if ($LASTEXITCODE -ne 0) { git status --short; throw 'Watchdog integration conflict; no artifact built' }
+          if (-not (Get-Content crates/xcl/src/hle/d3d12x/pso_async.rs -Raw).Contains('pub fn title_held()')) { throw 'Pipeline hold missing' }
+          if (-not (Get-Content crates/xcl/src/hle/kernelx.rs -Raw).Contains('pub unsafe extern "system" fn Sleep(ms: u32)')) { throw 'Title Sleep export missing' }
+          git diff --stat HEAD~1 HEAD
       - name: Set up Rust
         run: |
           rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
@@ -56,15 +68,45 @@ jobs:
         run: |
           & target/release/xcl.exe --version
           if ($LASTEXITCODE -ne 0) { throw 'XCL version check failed' }
-      - name: Upstream unit tests
+      - name: Build full workspace for end-to-end tests
         working-directory: xcl
-        run: cargo test --locked -p xcl --lib -- --test-threads=4
+        run: cargo build --locked --workspace
+      - name: Full upstream test suite
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          cargo test --locked --workspace -- --test-threads=4 2>&1 | Tee-Object -FilePath ci-tests.log
+          if ($LASTEXITCODE -ne 0) { throw "Test suite failed: $LASTEXITCODE" }
+      - name: Locate compiled library test harness
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $items = @(cargo test --locked -p xcl --lib --no-run --message-format=json | ForEach-Object {
+            try { $item = $_ | ConvertFrom-Json } catch { return }
+            if ($item.reason -eq 'compiler-artifact' -and $item.target.name -eq 'xcl' -and $item.profile.test -and $item.executable) { $item.executable }
+          })
+          if ($LASTEXITCODE -ne 0 -or $items.Count -ne 1) { throw 'Cannot locate unique compiled library test executable' }
+          $items[0] | Set-Content -Encoding utf8 $env:RUNNER_TEMP/xcl-test-path.txt
       - name: Package standalone runtime and corresponding source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item xcl/target/release/xcl.exe,xcl/LICENSE,xcl/README.md dist
+          Copy-Item xcl/ci-tests.log dist/CI-TESTS.log
+          New-Item -ItemType Directory -Path dist/tests | Out-Null
+          $testExe = (Get-Content $env:RUNNER_TEMP/xcl-test-path.txt -Raw).Trim()
+          Copy-Item -LiteralPath $testExe -Destination dist/tests/xcl-tests.exe
+          @'
+          Base: xcl-dev/xcl 9e3831e1f570d3646e53ab753b19ec07eb8f1485
+          Mesh: PR 541, seven commits through 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
+          Watchdog: PR 1288, 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          Launcher: async=1, lazy=1, preload=0, DXC workers=6, sleep hold=100ms, no bind timeout, activity logging enabled.
+          CI-TESTS.log contains actual CI test output; GPU skips are not GPU coverage.
+          This integration is intended to prevent the title's stall check counting time held in a pipeline build. Reaching gameplay is not established.
+          GPU test harness: set XCL_DXC_DIR to this directory, then run tests/xcl-tests.exe --test-threads=4 --nocapture.
+          Integration prepared in ChatGPT Work by Codex (GPT-6). Runtime corrections retain their upstream authors and source provenance.
+          '@ | Set-Content -Encoding utf8 dist/BUILD-INFO.txt
           @'
           @echo off
           setlocal
@@ -72,8 +114,11 @@ jobs:
           set "XCL_LAZY_PSO=1"
           set "XCL_PSO_PRELOAD=0"
           set "XCL_DXC_THREADS=6"
+          set "XCL_SLEEP_HOLD=100"
+          set "XCL_PSO_WAIT_MS=0"
+          set "XCL_ACTIVITY=1"
           set "GAME=%~1"
-          if not defined GAME set /p "GAME=Game folder or executable: "
+          if not defined GAME set "GAME=D:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
           if not defined GAME exit /b 2
           set "GAME=%GAME:"=%"
           if not exist "%GAME%" (
@@ -102,6 +147,6 @@ jobs:
           Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: xcl-integrated-main-mesh-performance-windows-x64
+          name: xcl-mesh-watchdog-performance-windows-x64
           path: dist/
           if-no-files-found: error
