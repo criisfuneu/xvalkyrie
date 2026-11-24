@@ -71,11 +71,11 @@ jobs:
       - name: Build full workspace for end-to-end tests
         working-directory: xcl
         run: cargo build --locked --workspace
-      - name: Full upstream test suite
+      - name: Upstream CI suite with documented no-GPU exception
         working-directory: xcl
         shell: pwsh
         run: |
-          cargo test --locked --workspace -- --test-threads=4 2>&1 | Tee-Object -FilePath ci-tests.log
+          cargo test --locked --workspace -- --test-threads=4 --skip test_title_runs_and_game_folder_is_untouched 2>&1 | Tee-Object -FilePath ci-tests.log
           if ($LASTEXITCODE -ne 0) { throw "Test suite failed: $LASTEXITCODE" }
       - name: Locate compiled library test harness
         working-directory: xcl
@@ -97,12 +97,15 @@ jobs:
           New-Item -ItemType Directory -Path dist/tests | Out-Null
           $testExe = (Get-Content $env:RUNNER_TEMP/xcl-test-path.txt -Raw).Trim()
           Copy-Item -LiteralPath $testExe -Destination dist/tests/xcl-tests.exe
+          Copy-Item -LiteralPath xcl/tests/data/testgame -Destination dist/tests/testgame -Recurse
+          Copy-Item xcl/target/debug/xcl_testtitle.exe,xcl/target/debug/testgame_mw.dll dist/tests/testgame
           @'
           Base: xcl-dev/xcl 9e3831e1f570d3646e53ab753b19ec07eb8f1485
           Mesh: PR 541, seven commits through 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
           Watchdog: PR 1288, 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
           Launcher: async=1, lazy=1, preload=0, DXC workers=6, sleep hold=100ms, no bind timeout, activity logging enabled.
           CI-TESTS.log contains actual CI test output; GPU skips are not GPU coverage.
+          As in upstream CI, test_title_runs_and_game_folder_is_untouched is filtered out because the hosted runner has no supported GPU. The included tests/testgame fixture allows a real-GPU check locally.
           This integration is intended to prevent the title's stall check counting time held in a pipeline build. Reaching gameplay is not established.
           GPU test harness: set XCL_DXC_DIR to this directory, then run tests/xcl-tests.exe --test-threads=4 --nocapture.
           Integration prepared in ChatGPT Work by Codex (GPT-6). Runtime corrections retain their upstream authors and source provenance.
