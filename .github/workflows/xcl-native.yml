@@ -41,6 +41,28 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item xcl/target/release/xcl.exe,xcl/LICENSE,xcl/README.md dist
+          @'
+          @echo off
+          setlocal
+          set "XCL_ASYNC_PSO=1"
+          set "XCL_LAZY_PSO=1"
+          set "XCL_PSO_PRELOAD=0"
+          set "XCL_DXC_THREADS=6"
+          set "GAME=%~1"
+          if not defined GAME set /p "GAME=Game folder or executable: "
+          if not defined GAME exit /b 2
+          set "GAME=%GAME:"=%"
+          if not exist "%GAME%" (
+            echo Path not found.
+            pause
+            exit /b 2
+          )
+          "%~dp0xcl.exe" run "%GAME%"
+          set "RC=%ERRORLEVEL%"
+          echo XCL exit code: %RC%
+          pause
+          exit /b %RC%
+          '@ | Set-Content -Encoding ascii dist/XCL-Performance.cmd
           $dxcZip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
           $dxcDir = Join-Path $env:RUNNER_TEMP 'dxc'
           Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
@@ -56,6 +78,6 @@ jobs:
           Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: xcl-mesh-pr541-6bd8f64-windows-x64
+          name: xcl-mesh-pr541-6bd8f64-performance-windows-x64
           path: dist/
           if-no-files-found: error
