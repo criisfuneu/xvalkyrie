@@ -29,15 +29,15 @@ jobs:
           git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "PR322 conflicts: $(git -C victory-src diff --name-only --diff-filter=U)" }
 
-          git -C victory-src fetch origin pull/464/head
-          if ($LASTEXITCODE -ne 0) { throw 'PR464 fetch failed' }
-          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) { throw "PR464 conflicts: $(git -C victory-src diff --name-only --diff-filter=U)" }
+          # PR464 does not cherry-pick onto main after its overflow fix.
+          # Apply a guarded, assertion-checked port; keep main's saturating math.
+          py experimental/victory/apply_watch_absent.py victory-src
+          if ($LASTEXITCODE -ne 0) { throw 'PR464 backport failed: source layout changed' }
 
           $combined = (git -C victory-src rev-parse HEAD).Trim()
           "VIctory upstream main ffe310eb2098e52169f4c44db5ffdabf43a72622" | Set-Content provenance.txt
           "Memory copies: PR #322, avoid per-copy VirtualQuery overhead" | Add-Content provenance.txt
-          "Guarded unmapped blocks: PR #464, avoid re-copying holes every frame" | Add-Content provenance.txt
+          "Guarded unmapped blocks: PR #464 manually backported via experimental/victory/apply_watch_absent.py" | Add-Content provenance.txt
           "Root-UAV PR #294/#709 not included, old branch conflicts with latest upstream" | Add-Content provenance.txt
           "Combined source commit $combined" | Add-Content provenance.txt
           "VIctory GPL-3.0-or-later; XCL stays separate" | Add-Content provenance.txt
