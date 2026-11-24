@@ -1,7 +1,7 @@
-name: XCL native Windows x64
+name: XCL experimental Mesh PSO PR 541 Windows x64
 on:
   push:
-    branches: ["build/xcl-native"]
+    branches: ["build/xcl-mesh-541"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,8 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: xcl-dev/xcl
-          ref: 9e3831e1f570d3646e53ab753b19ec07eb8f1485
+          repository: ryosen0/xcl
+          ref: 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
           path: xcl
           persist-credentials: false
       - name: Set up Rust
@@ -56,6 +56,6 @@ jobs:
           Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: xcl-native-9e3831e-windows-x64
+          name: xcl-mesh-pr541-6bd8f64-windows-x64
           path: dist/
           if-no-files-found: error
