@@ -1,0 +1,69 @@
+name: XCL Mesh + Fastboot Preview (Windows)
+
+on:
+  push:
+    branches:
+      - xcl-mesh-fastboot-20261124
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mesh-fastboot:
+    runs-on: windows-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Combine mesh fix PR 541 and optional Bink skip PR 1053
+        shell: pwsh
+        run: |
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          git -C xcl-src fetch origin pull/541/head
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch mesh PR 541' }
+          git -C xcl-src checkout FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not checkout mesh PR' }
+          $mesh = (git -C xcl-src rev-parse HEAD).Trim()
+          git -C xcl-src fetch origin pull/1053/head
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch fastboot PR 1053' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'PR 1053 did not cherry-pick cleanly: STOP; no artifact created' }
+          $fastboot = (git -C xcl-src rev-parse HEAD).Trim()
+          "Mesh PR head: $mesh" | Set-Content -Path source-commits.txt
+          "Fastboot cherry-pick commit: $fastboot" | Add-Content -Path source-commits.txt
+          "Fastboot source: 4f4db6452875984c003623ec8aef9f7e54df5ed9" | Add-Content -Path source-commits.txt
+      - name: Apply proven fixed-base loader and xmem patch
+        shell: pwsh
+        run: |
+          py experimental/xcl/apply_fix.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Loader patch incompatible with upstream revisions' }
+      - name: Build release
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release --locked -p xcl
+      - name: Test xcl library
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+      - name: Package standalone executable and starter
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item xcl-src/target/release/xcl.exe output/
+          Copy-Item xcl-src/LICENSE output/
+          Copy-Item source-commits.txt output/
+          Copy-Item experimental/fastboot/Start-Mesh-Fastboot.ps1 output/
+          @'
+          Upstream: https://github.com/ivall/xcl
+          Includes PR 541 mesh fix and opt-in PR 1053 Bink video skip.
+          Includes experimental/xcl/apply_fix.py loader fix.
+          Does not include game files, title data, or Microsoft binaries.
+          No guarantees of gameplay or hardware stability.
+          '@ | Set-Content output/README-XVal.txt -Encoding UTF8
+      - name: Upload preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-mesh-fastboot-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
