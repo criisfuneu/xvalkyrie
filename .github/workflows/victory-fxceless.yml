@@ -49,7 +49,7 @@ jobs:
           # SM 6.6 adapter exists. Its own source says WARP refuses its pipeline.
           # Filter only that test here; package its original test harness for the
           # real Radeon check. No runtime source or test implementation is edited.
-          cargo test --workspace --locked -- --nocapture --skip emit::valu_tests::ds_min_max_f32_order_floats_and_return_the_old_value 2>&1 | Tee-Object -FilePath ci-tests.log
+          cargo test --workspace --locked -- --nocapture --skip emit::valu_tests::ds_min_max_f32_order_floats_and_return_the_old_value 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/victory-ci-tests.log"
           if ($LASTEXITCODE -ne 0) { throw "Workspace tests failed: $LASTEXITCODE" }
       - name: Build unmodified optimized runtime
         working-directory: victory
@@ -83,7 +83,7 @@ jobs:
           New-Item -ItemType Directory -Path dist,dist/tests | Out-Null
           Copy-Item victory/target/release/victory.exe,victory/LICENSE,victory/README.md dist
           Copy-Item victory/target/diag/victory.exe dist/victory-diagnostics.exe
-          Copy-Item victory/ci-tests.log dist/CI-TESTS.log
+          Copy-Item "$env:RUNNER_TEMP/victory-ci-tests.log" dist/CI-TESTS.log
           if (Test-Path victory/target/release/victory.pdb) { Copy-Item victory/target/release/victory.pdb dist }
           if (Test-Path victory/target/diag/victory.pdb) { Copy-Item victory/target/diag/victory.pdb dist/victory-diagnostics.pdb }
           $paths = Get-Content "$env:RUNNER_TEMP/victory-test-paths.json" -Raw | ConvertFrom-Json
