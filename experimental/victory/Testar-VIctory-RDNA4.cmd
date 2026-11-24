@@ -2,6 +2,7 @@
 setlocal
 set "GAME_DIR=D:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
 set "GAME_EXE=%GAME_DIR%\game_scarlett_master.exe"
+set "VICTORY_GAME_DIR=%GAME_DIR%"
 if not exist "%~dp0victory.exe" (
   echo ERRO: victory.exe nao encontrado nesta pasta.
   pause
@@ -12,6 +13,7 @@ if not exist "%GAME_EXE%" (
   pause
   exit /b 2
 )
+if not exist "%~dp0victory.toml" if exist "%~dp0victory.example.toml" copy /Y "%~dp0victory.example.toml" "%~dp0victory.toml" >nul
 echo VIctory experimental - AMD Radeon RX 9070 XT
 echo Sem modificar arquivos do jogo. Driver D3D12 real.
 echo Logs e arquivos derivados ficam fora da pasta do jogo.
