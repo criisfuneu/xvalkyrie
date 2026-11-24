@@ -1,7 +1,7 @@
-name: XCL mesh plus watchdog Windows x64
+name: XCL GPU dispatch diagnostics Windows x64
 on:
   push:
-    branches: ["build/xcl-mesh-watchdog-20261124"]
+    branches: ["build/xcl-gpu-culprit-20261124"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -55,6 +55,33 @@ jobs:
           if (-not (Get-Content crates/xcl/src/hle/d3d12x/pso_async.rs -Raw).Contains('pub fn title_held()')) { throw 'Pipeline hold missing' }
           if (-not (Get-Content crates/xcl/src/hle/kernelx.rs -Raw).Contains('pub unsafe extern "system" fn Sleep(ms: u32)')) { throw 'Title Sleep export missing' }
           git diff --stat HEAD~1 HEAD
+      - name: Add reviewed dispatch markers and report them on device removal
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags --depth=2 https://github.com/IvyNotFound/xcl.git a79d09d3d74525238429f83853622795f764d2e9
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned GPU diagnostics failed' }
+          git cherry-pick -x a79d09d3d74525238429f83853622795f764d2e9
+          if ($LASTEXITCODE -ne 0) { git status --short; throw 'GPU diagnostics integration conflict; no artifact built' }
+          $file = 'crates/xcl/src/hle/d3d12x/real.rs'
+          $text = [IO.File]::ReadAllText($file)
+          $anchor = '    crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());'
+          if ($text.Split([string[]]@($anchor), [StringSplitOptions]::None).Count -ne 2) { throw 'Device removal diagnostic anchor is not unique' }
+          $text = $text.Replace($anchor, $anchor + "`n    super::culprit::on_watchdog_release();")
+          [IO.File]::WriteAllText($file, $text, [Text.UTF8Encoding]::new($false))
+          [IO.File]::AppendAllText('README.md', @'
+
+          ## Integrated GPU dispatch diagnostics
+
+          This build includes upstream PR 1323. Set XCL_GPU_CULPRIT=1 to record dispatch markers.
+          Pending dispatches are reported on GPU-wait releases and device removal, subject to the
+          upstream diagnostic rate limit. With the variable unset, instrumentation stays off.
+          This records evidence of stalled GPU work; it does not establish a graphics-hang fix.
+          '@, [Text.UTF8Encoding]::new($false))
+          git add crates/xcl/src/hle/d3d12x/real.rs README.md
+          git commit -m "D3D12.X: report pending dispatch markers on device removal" -m "Extend the opt-in upstream diagnostics to the failure captured locally. Assisted-by: Codex (GPT-6)."
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record the diagnostic source revision' }
       - name: Set up Rust
         run: |
           rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
@@ -107,6 +134,9 @@ jobs:
           CI-TESTS.log contains actual CI test output; GPU skips are not GPU coverage.
           As in upstream CI, test_title_runs_and_game_folder_is_untouched is filtered out because the hosted runner has no supported GPU. The included tests/testgame fixture allows a real-GPU check locally.
           This integration is intended to prevent the title's stall check counting time held in a pipeline build. Reaching gameplay is not established.
+          Diagnostics: PR 1323, a79d09d3d74525238429f83853622795f764d2e9, plus a diagnostic-only report on device removal.
+          Run XCL-Diagnostico-GPU.cmd for the next captured run. Dispatch markers stay off in the normal launcher unless explicitly inherited from its environment.
+          DRED and the D3D12 debug layer are left off in the diagnostic launcher to preserve the existing pipeline-cache conditions.
           GPU test harness: set XCL_DXC_DIR to this directory, then run tests/xcl-tests.exe --test-threads=4 --nocapture.
           Integration prepared in ChatGPT Work by Codex (GPT-6). Runtime corrections retain their upstream authors and source provenance.
           '@ | Set-Content -Encoding utf8 dist/BUILD-INFO.txt
@@ -135,6 +165,9 @@ jobs:
           pause
           exit /b %RC%
           '@ | Set-Content -Encoding ascii dist/XCL-Performance.cmd
+          $launch = [IO.File]::ReadAllText('dist/XCL-Performance.cmd')
+          $diagnostic = 'setlocal' + "`r`n" + 'set "XCL_GPU_CULPRIT=1"' + "`r`n" + 'set "XCL_DRED="' + "`r`n" + 'set "XCL_D3D12_DEBUG="' + "`r`n" + 'set "XCL_NETWORK=0"'
+          [IO.File]::WriteAllText('dist/XCL-Diagnostico-GPU.cmd', $launch.Replace('setlocal', $diagnostic), [Text.Encoding]::ASCII)
           $dxcZip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
           $dxcDir = Join-Path $env:RUNNER_TEMP 'dxc'
           Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
@@ -150,6 +183,6 @@ jobs:
           Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: xcl-mesh-watchdog-performance-windows-x64
+          name: xcl-gpu-culprit-performance-windows-x64
           path: dist/
           if-no-files-found: error
