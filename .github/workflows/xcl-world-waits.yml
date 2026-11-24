@@ -1,0 +1,142 @@
+name: XCL World-Waits + DirectStorage Candidate
+
+on:
+  push:
+    branches:
+      - xcl-world-waits-20261124
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose mesh and BCPack without async texture upload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Clone failed' }
+          git -C xcl-src fetch origin pull/541/head
+          if ($LASTEXITCODE -ne 0) { throw 'Mesh fetch failed' }
+          git -C xcl-src checkout FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Mesh checkout failed' }
+          $mesh = (git -C xcl-src rev-parse HEAD).Trim()
+
+          # IMPORTANT: omit PR #455 (async texture uploads) to isolate black-screen regression
+          # Keep baseline title-texture path; BCPack still gets enabled for world assets.
+
+          git -C xcl-src fetch origin pull/905/head
+          if ($LASTEXITCODE -ne 0) { throw 'BCPack PR fetch failed' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+            if ($unmerged.Count -ne 1 -or $unmerged[0] -ne 'crates/xcl/src/hle/mod.rs') {
+              throw "Unexpected BCPack conflicts: $($unmerged -join ', ')"
+            }
+            git -C xcl-src checkout --ours -- crates/xcl/src/hle/mod.rs
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve BCPack module conflict' }
+            $p = 'xcl-src/crates/xcl/src/hle/mod.rs'
+            $src = [IO.File]::ReadAllText((Resolve-Path $p))
+            if (-not $src.Contains('pub mod bcpack;')) {
+              if (-not $src.Contains('pub mod acphal;')) { throw 'Unexpected mod file layout' }
+              $src = $src.Replace('pub mod acphal;', ('pub mod acphal;' + [Environment]::NewLine + 'pub mod bcpack;'))
+              [IO.File]::WriteAllText((Resolve-Path $p), $src)
+            }
+            git -C xcl-src add crates/xcl/src/hle/mod.rs
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick --continue
+            if ($LASTEXITCODE -ne 0) { throw 'BCPack cherry-pick not resolved' }
+          }
+
+          git -C xcl-src fetch origin pull/1053/head
+          if ($LASTEXITCODE -ne 0) { throw 'Bink skip PR fetch failed' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+            if ($unmerged.Count -ne 1 -or $unmerged[0] -ne 'crates/xcl/src/hle/mod.rs') {
+              throw "Unexpected Bink skip conflicts: $($unmerged -join ', ')"
+            }
+            git -C xcl-src checkout --ours -- crates/xcl/src/hle/mod.rs
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot restore mod.rs' }
+            $p = 'xcl-src/crates/xcl/src/hle/mod.rs'
+            $src = [IO.File]::ReadAllText((Resolve-Path $p))
+            if (-not $src.Contains('pub mod bink;')) {
+              if (-not $src.Contains('pub mod acphal;')) { throw 'Unexpected mod file layout' }
+              $src = $src.Replace('pub mod acphal;', ('pub mod acphal;' + [Environment]::NewLine + 'pub mod bink;'))
+              [IO.File]::WriteAllText((Resolve-Path $p), $src)
+            }
+            git -C xcl-src add crates/xcl/src/hle/mod.rs
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick --continue
+            if ($LASTEXITCODE -ne 0) { throw 'Bink skip cherry-pick not resolved' }
+          }
+
+          # Graphics progress: PR #891 opts in to bounded PSO build waits.
+          git -C xcl-src fetch origin pull/891/head
+          if ($LASTEXITCODE -ne 0) { throw 'PSO-wait PR fetch failed' }
+          $pso = @(git -C xcl-src rev-list --reverse --max-count=2 FETCH_HEAD)
+          if ($pso.Count -ne 2) { throw 'PR 891 did not contain two expected commits' }
+          foreach ($rev in $pso) {
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $rev
+            if ($LASTEXITCODE -ne 0) { throw "PR 891 could not be applied (conflicts): $(git -C xcl-src diff --name-only --diff-filter=U)" }
+          }
+
+          # DirectStorage 0x89240009: page array not filled until title's Submit.
+          git -C xcl-src fetch origin pull/549/head
+          if ($LASTEXITCODE -ne 0) { throw 'DirectStorage late-pages PR fetch failed' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "PR 549 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
+
+          # DirectStorage 0x89240009: GPU view can be mirrored to CPU view.
+          git -C xcl-src fetch origin pull/979/head
+          if ($LASTEXITCODE -ne 0) { throw 'DirectStorage GPU mirror PR fetch failed' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "PR 979 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
+
+          $last=(git -C xcl-src rev-parse HEAD).Trim()
+          "Mesh base: $mesh" | Set-Content provenance.txt -Encoding UTF8
+          "Texture uploads: original mesh baseline, PR #455 deliberately EXCLUDED (regression isolation)" | Add-Content provenance.txt
+          "BCPack decoder: PR #905 (cd03bd9), adapted from VIctory" | Add-Content provenance.txt
+          "Optional intro skip: PR #1053 (4f4db64)" | Add-Content provenance.txt
+          "PSO budget: PR #891 (optional XCL_PSO_WAIT_MS=50)" | Add-Content provenance.txt
+          "DirectStorage late pages: PR #549" | Add-Content provenance.txt
+          "DirectStorage GPU/CPU views: PR #979" | Add-Content provenance.txt
+          "Combined source commit: $last" | Add-Content provenance.txt
+
+      - name: Apply fixed-base loader and xmem fixes
+        shell: pwsh
+        run: |
+          py experimental/xcl/apply_fix.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Known-good loader patch failed' }
+
+      - name: Build release binary
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release --locked -p xcl
+
+      - name: Run automated library tests
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+
+      - name: Package executable and selectable intro
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item xcl-src/target/release/xcl.exe output/
+          Copy-Item xcl-src/LICENSE output/
+          Copy-Item xcl-src/THIRD_PARTY.md output/
+          Copy-Item provenance.txt output/
+          Copy-Item experimental/video/* output/
+          Copy-Item experimental/cache/Prepare-XCL-Cache.ps1 output/
+          Copy-Item experimental/world/* output/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-world-waits-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
