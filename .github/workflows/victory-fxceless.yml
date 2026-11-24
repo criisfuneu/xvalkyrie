@@ -1,0 +1,173 @@
+name: VIctory fxceless pinned Windows build
+on:
+  push:
+    branches: [build/victory-fxceless-20261124]
+    paths: [.github/workflows/victory-fxceless.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: victory-fxceless-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out reviewed upstream revision
+        uses: actions/checkout@v5
+        with:
+          repository: fxceless/victory-gta6
+          ref: 7b0f736d0b29c2c512a9506e38df92f1f8d50986
+          path: victory
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        working-directory: victory
+        run: |
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed' }
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: victory -> target
+      - name: Clippy, standard build
+        working-directory: victory
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        working-directory: victory
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Full workspace tests on hosted software adapter
+        working-directory: victory
+        env:
+          VICTORY_WARP: "1"
+        run: |
+          # Upstream's exact revision fails one hardware-only test on hosted CI:
+          # ds_min_max_f32_order_floats_and_return_the_old_value asserts that a
+          # SM 6.6 host exists, after hardware detection correctly rejects WARP.
+          # The supported VICTORY_WARP switch runs the suite on WARP instead.
+          # No test is filtered out. This does not establish Radeon coverage.
+          cargo test --workspace --locked -- --nocapture 2>&1 | Tee-Object -FilePath ci-tests.log
+          if ($LASTEXITCODE -ne 0) { throw "Workspace tests failed: $LASTEXITCODE" }
+      - name: Build unmodified optimized runtime
+        working-directory: victory
+        run: cargo build --release --locked -p victory
+      - name: Build optimized diagnostics runtime
+        working-directory: victory
+        run: cargo build --profile diag --locked -p victory --features diagnostics
+      - name: Check both CLI entry points
+        working-directory: victory
+        run: |
+          & target/release/victory.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Release CLI failed' }
+          & target/diag/victory.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostics CLI failed' }
+      - name: Locate synthetic GPU test harnesses
+        working-directory: victory
+        run: |
+          $paths = @{}
+          foreach ($crate in @('victory-shader', 'victory-gpu')) {
+            $found = @(cargo test --locked -p $crate --lib --no-run --message-format=json | ForEach-Object {
+              try { $item = $_ | ConvertFrom-Json } catch { return }
+              if ($item.reason -eq 'compiler-artifact' -and $item.target.name -eq $crate.Replace('-', '_') -and $item.profile.test -and $item.executable) { $item.executable }
+            })
+            if ($LASTEXITCODE -ne 0 -or $found.Count -ne 1) { throw "Cannot locate $crate test executable" }
+            $paths[$crate] = $found[0]
+          }
+          $paths | ConvertTo-Json | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/victory-test-paths.json"
+      - name: Package runtime, matching source, logs and launchers
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist,dist/tests | Out-Null
+          Copy-Item victory/target/release/victory.exe,victory/LICENSE,victory/README.md dist
+          Copy-Item victory/target/diag/victory.exe dist/victory-diagnostics.exe
+          Copy-Item victory/ci-tests.log dist/CI-TESTS.log
+          if (Test-Path victory/target/release/victory.pdb) { Copy-Item victory/target/release/victory.pdb dist }
+          if (Test-Path victory/target/diag/victory.pdb) { Copy-Item victory/target/diag/victory.pdb dist/victory-diagnostics.pdb }
+          $paths = Get-Content "$env:RUNNER_TEMP/victory-test-paths.json" -Raw | ConvertFrom-Json
+          Copy-Item -LiteralPath $paths.'victory-shader' -Destination dist/tests/victory-shader-tests.exe
+          Copy-Item -LiteralPath $paths.'victory-gpu' -Destination dist/tests/victory-gpu-tests.exe
+          @'
+          Source: https://github.com/fxceless/victory-gta6
+          Source commit: 7b0f736d0b29c2c512a9506e38df92f1f8d50986
+          Runtime source is unmodified. GPL-3.0-or-later; corresponding source in victory-source.zip.
+          Includes e9765a7: opt-in wave64 cross-wave barrier lowering and cache switch identities.
+          Compiler: pinned rust-toolchain.toml, x86_64-pc-windows-msvc.
+          CI: upstream Clippy checks; workspace tests using VICTORY_WARP=1.
+          CI software tests and capability skips do not establish execution on AMD Radeon.
+          CI-TESTS.log contains the complete test results and explicit skip messages.
+          Launch profile: Series X, automatic native wave width, VICTORY_WAVE_WIDE=0.
+          Experimental relay, late-wait, in-place buffers and ray tracing remain at upstream defaults.
+          Data and cache: %LOCALAPPDATA%\VIctory-fxceless\7b0f736\
+          Launchers clear inherited VICTORY_* overrides before setting this profile.
+          victory.exe is a release build. victory-diagnostics.exe is optimized with diagnostics compiled in.
+          No game files, game logs, saves, caches or derived shaders are included.
+          The fork author reports first-prologue rendering at 2-4 FPS on RTX 4070.
+          Correctly rendered or playable gameplay on this user's Radeon is not established.
+          Build packaging prepared in ChatGPT Work with Codex (GPT-6).
+          '@ | Set-Content -Encoding utf8 dist/BUILD-INFO.txt
+          @'
+          @echo off
+          setlocal
+          for /f "tokens=1 delims==" %%V in ('set VICTORY_ 2^>nul') do set "%%V="
+          set "VICTORY_GAME_EXE=%~1"
+          if not defined VICTORY_GAME_EXE set "VICTORY_GAME_EXE=D:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
+          if exist "%VICTORY_GAME_EXE%\game_scarlett_master.exe" set "VICTORY_GAME_EXE=%VICTORY_GAME_EXE%\game_scarlett_master.exe"
+          if not exist "%VICTORY_GAME_EXE%" (
+            echo Executavel do jogo nao encontrado.
+            pause
+            exit /b 2
+          )
+          set "VICTORY_PACKAGE=%~dp0"
+          set "VICTORY_EXE=%~dp0victory.exe"
+          set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory-fxceless\7b0f736\cache"
+          set "VICTORY_DATA_DIR=%LOCALAPPDATA%\VIctory-fxceless\7b0f736\data"
+          set "VICTORY_LOG_DIR=%LOCALAPPDATA%\VIctory-fxceless\7b0f736\logs"
+          set "VICTORY_WAVE_WIDE=0"
+          set "VICTORY_LOG=info"
+          pushd "%~dp0"
+          powershell.exe -NoProfile -Command "$ErrorActionPreference='Continue'; $env:VICTORY_GAME_DIR=Split-Path -LiteralPath $env:VICTORY_GAME_EXE; New-Item -ItemType Directory -Force -Path $env:VICTORY_LOG_DIR | Out-Null; $log=Join-Path $env:VICTORY_LOG_DIR ('run-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff')+'.log'); Write-Host ('Log em tempo real: '+$log); @('Source: fxceless/victory-gta6 7b0f736d0b29c2c512a9506e38df92f1f8d50986', ('Started: '+(Get-Date -Format o)), ('Runtime: '+$env:VICTORY_EXE), ('Game: '+$env:VICTORY_GAME_EXE)) | Set-Content -LiteralPath $log -Encoding Unicode; & $env:VICTORY_EXE run $env:VICTORY_GAME_EXE --execute --console series-x 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath $log -Append; $rc=$LASTEXITCODE; ('Exit: '+$rc) | Tee-Object -FilePath $log -Append; exit $rc"
+          set "RC=%ERRORLEVEL%"
+          popd
+          echo VIctory exit code: %RC%
+          pause
+          exit /b %RC%
+          '@ | Set-Content -Encoding ascii dist/Iniciar-VIctory.cmd
+          $launch = [IO.File]::ReadAllText('dist/Iniciar-VIctory.cmd')
+          $diag = $launch.Replace('set "VICTORY_EXE=%~dp0victory.exe"', 'set "VICTORY_EXE=%~dp0victory-diagnostics.exe"')
+          [IO.File]::WriteAllText('dist/Iniciar-VIctory-Diagnostico.cmd', $diag, [Text.Encoding]::ASCII)
+          @'
+          Extraia todo o ZIP antes de executar.
+          Abra Iniciar-VIctory.cmd. O caminho do jogo neste PC ja esta configurado.
+          Tambem e possivel arrastar a pasta do jogo ou seu executavel sobre o CMD.
+          As linhas aparecem no terminal e sao salvas em:
+          %LOCALAPPDATA%\VIctory-fxceless\7b0f736\logs
+          O programa tambem registra falhas em crashes.log dentro da pasta data.
+          Use Iniciar-VIctory-Diagnostico.cmd se precisarmos de instrumentacao adicional.
+          A primeira traducao de shaders pode demorar. O cache e mantido entre execucoes.
+          Esta versao tem cache e saves separados dos experimentos anteriores.
+          O autor relata a intro e a primeira cena do prologo numa RTX 4070, com 2-4 FPS
+          e sombras pretas. O resultado nesta Radeon ainda precisa ser medido.
+          As variaveis XCL_* pertencem ao outro runtime e nao configuram o VIctory.
+          '@ | Set-Content -Encoding utf8 dist/LEIA-ME.txt
+          $dxcZip = Join-Path $env:RUNNER_TEMP 'victory-dxc.zip'
+          $dxcDir = Join-Path $env:RUNNER_TEMP 'victory-dxc'
+          Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
+          if ((Get-FileHash $dxcZip -Algorithm SHA256).Hash -ne '9ad895a6b039e3a8f8c22a1009f866800b840a74b50db9218d13319e215ea8a4') { throw 'DXC SHA256 mismatch' }
+          Expand-Archive $dxcZip -DestinationPath $dxcDir
+          Copy-Item "$dxcDir/bin/x64/dxcompiler.dll","$dxcDir/bin/x64/dxil.dll","$dxcDir/bin/x64/dxc.exe" dist
+          New-Item -ItemType Directory dist/DXC-notices | Out-Null
+          Get-ChildItem $dxcDir -File | Where-Object { $_.Name -match 'license|notice|readme' } | Copy-Item -Destination dist/DXC-notices
+          git -C victory rev-parse HEAD | Set-Content dist/UPSTREAM-COMMIT.txt
+          git -C victory archive --format=zip --output="$env:GITHUB_WORKSPACE/dist/victory-source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+          Get-ChildItem dist -File -Recurse | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-fxceless-7b0f736-windows-x64
+          path: dist/
+          if-no-files-found: error
