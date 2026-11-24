@@ -1,4 +1,4 @@
-name: XCL World-Waits + DirectStorage Candidate
+name: XCL World-Waits + DirectStorage Queue (verified)
 
 on:
   push:
@@ -90,11 +90,9 @@ jobs:
           git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "PR 549 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
 
-          # DirectStorage 0x89240009: GPU view can be mirrored to CPU view.
-          git -C xcl-src fetch origin pull/979/head
-          if ($LASTEXITCODE -ne 0) { throw 'DirectStorage GPU mirror PR fetch failed' }
-          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) { throw "PR 979 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
+          # PR #979 is deliberately excluded for now. Its BCPack-fill test fails
+          # when combined with PR #905's actual BCPack decoder (694 pass, 1 fail).
+          # Keep PR #549 to fix deferred DirectStorage page arrays without this regression.
 
           $last=(git -C xcl-src rev-parse HEAD).Trim()
           "Mesh base: $mesh" | Set-Content provenance.txt -Encoding UTF8
@@ -103,7 +101,7 @@ jobs:
           "Optional intro skip: PR #1053 (4f4db64)" | Add-Content provenance.txt
           "PSO budget: PR #891 (optional XCL_PSO_WAIT_MS=50)" | Add-Content provenance.txt
           "DirectStorage late pages: PR #549" | Add-Content provenance.txt
-          "DirectStorage GPU/CPU views: PR #979" | Add-Content provenance.txt
+          "DirectStorage CPU/GPU views: PR #979 excluded due to reproducible BC fill test failure" | Add-Content provenance.txt
           "Combined source commit: $last" | Add-Content provenance.txt
 
       - name: Apply fixed-base loader and xmem fixes
