@@ -1,7 +1,7 @@
-name: XCL experimental Mesh PSO PR 541 Windows x64
+name: XCL integrated main plus Mesh PSO Windows x64
 on:
   push:
-    branches: ["build/xcl-mesh-541"]
+    branches: ["build/xcl-mesh-integrated"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,10 +15,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ryosen0/xcl
-          ref: 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
+          repository: xcl-dev/xcl
+          ref: 9e3831e1f570d3646e53ab753b19ec07eb8f1485
           path: xcl
           persist-credentials: false
+      - name: Integrate only reviewed mesh changes on known-good upstream
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "XCL Integration CI"
+          git config user.email "xcl-integration@users.noreply.github.com"
+          git fetch --no-tags --depth=8 https://github.com/ryosen0/xcl.git 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned PR failed' }
+          $commits = @(
+            '301adaea6240613638f51c0d2ed920a47b9d6121',
+            'd42b820efd6369488ef1bcf4af3c8fa33937caea',
+            '2915f227936deaa33050692712884da7585b8424',
+            '70f91859a82bfb1aa2e35399203af90d104cb87c',
+            '48c1517a0c48a5a9cf890c67c5b3a61438e70cd4',
+            '7654a2a4eaba17d8252b686149600721b76489b7',
+            '6bd8f641040071b8a388c0ec3053c2b1483ddcdf'
+          )
+          foreach ($commit in $commits) {
+            git cherry-pick -x $commit
+            if ($LASTEXITCODE -ne 0) { git status --short; throw "Conflict integrating $commit; no artifact built" }
+          }
+          git diff --stat 9e3831e1f570d3646e53ab753b19ec07eb8f1485 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify integration' }
       - name: Set up Rust
         run: |
           rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
@@ -78,6 +102,6 @@ jobs:
           Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: xcl-mesh-pr541-6bd8f64-performance-windows-x64
+          name: xcl-integrated-main-mesh-performance-windows-x64
           path: dist/
           if-no-files-found: error
