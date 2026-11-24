@@ -78,19 +78,16 @@ jobs:
           }
           "Compact compute: upstream PRs #1315/#1316, XCL_COMPACT_CS=auto (0 disables)" | Add-Content provenance.txt
 
-      - name: Optionally give graphics pipelines priority over speculative compute
+      - name: Carefully port PR628 graphics-first scheduling to current XCL workers
         if: matrix.variant == 'compact-priority'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git -C xcl-src fetch origin pull/628/head
-          if ($LASTEXITCODE -ne 0) { throw 'PR628 fetch failed' }
-          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick 766b661235289f8c76b2a4169b046927fa3e8355
-          if ($LASTEXITCODE -ne 0) {
-            $conflicts = @(git -C xcl-src diff --name-only --diff-filter=U)
-            throw "PR628 conflicts with PR1288 ($($conflicts -join ', ')). Do not overwrite watchdog handling."
-          }
-          "Graphics PSO workers: priority queue upstream PR #628" | Add-Content provenance.txt
+          py experimental/fps/apply_graphics_priority.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Graphics-first patch rejected unexpected upstream source' }
+          git -C xcl-src diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Graphics-first patch has whitespace errors' }
+          "PR #628 worker scheduling adapted to modern PSO build(), preserving PR #1288" | Add-Content provenance.txt
 
       - name: Apply game boot compatibility patch without editing game
         shell: pwsh
