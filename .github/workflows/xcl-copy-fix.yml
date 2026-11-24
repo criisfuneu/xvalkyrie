@@ -1,0 +1,231 @@
+name: XCL GPU-view copy fix Windows x64
+on:
+  push:
+    branches: ["fix/xcl-gpu-view-copy-20261124"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xcl-dev/xcl
+          ref: 9e3831e1f570d3646e53ab753b19ec07eb8f1485
+          path: xcl
+          persist-credentials: false
+      - name: Integrate only reviewed mesh changes on known-good upstream
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "XCL Integration CI"
+          git config user.email "xcl-integration@users.noreply.github.com"
+          git fetch --no-tags --depth=8 https://github.com/ryosen0/xcl.git 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned PR failed' }
+          $commits = @(
+            '301adaea6240613638f51c0d2ed920a47b9d6121',
+            'd42b820efd6369488ef1bcf4af3c8fa33937caea',
+            '2915f227936deaa33050692712884da7585b8424',
+            '70f91859a82bfb1aa2e35399203af90d104cb87c',
+            '48c1517a0c48a5a9cf890c67c5b3a61438e70cd4',
+            '7654a2a4eaba17d8252b686149600721b76489b7',
+            '6bd8f641040071b8a388c0ec3053c2b1483ddcdf'
+          )
+          foreach ($commit in $commits) {
+            git cherry-pick -x $commit
+            if ($LASTEXITCODE -ne 0) { git status --short; throw "Conflict integrating $commit; no artifact built" }
+          }
+          git diff --stat 9e3831e1f570d3646e53ab753b19ec07eb8f1485 HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify integration' }
+      - name: Restore pinned watchdog hold without skipping dispatches
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags --depth=2 https://github.com/imnicho/xcl.git 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned watchdog correction failed' }
+          git cherry-pick -x 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          if ($LASTEXITCODE -ne 0) { git status --short; throw 'Watchdog integration conflict; no artifact built' }
+          if (-not (Get-Content crates/xcl/src/hle/d3d12x/pso_async.rs -Raw).Contains('pub fn title_held()')) { throw 'Pipeline hold missing' }
+          if (-not (Get-Content crates/xcl/src/hle/kernelx.rs -Raw).Contains('pub unsafe extern "system" fn Sleep(ms: u32)')) { throw 'Title Sleep export missing' }
+          git diff --stat HEAD~1 HEAD
+      - name: Add reviewed dispatch markers and report them on device removal
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --no-tags --depth=2 https://github.com/IvyNotFound/xcl.git a79d09d3d74525238429f83853622795f764d2e9
+          if ($LASTEXITCODE -ne 0) { throw 'Fetch of pinned GPU diagnostics failed' }
+          git cherry-pick -x a79d09d3d74525238429f83853622795f764d2e9
+          if ($LASTEXITCODE -ne 0) { git status --short; throw 'GPU diagnostics integration conflict; no artifact built' }
+          $file = 'crates/xcl/src/hle/d3d12x/real.rs'
+          $text = [IO.File]::ReadAllText($file)
+          $anchor = '    crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());'
+          if ($text.Split([string[]]@($anchor), [StringSplitOptions]::None).Count -ne 2) { throw 'Device removal diagnostic anchor is not unique' }
+          $text = $text.Replace($anchor, $anchor + "`n    super::culprit::on_watchdog_release();")
+          [IO.File]::WriteAllText($file, $text, [Text.UTF8Encoding]::new($false))
+          [IO.File]::AppendAllText('README.md', @'
+
+          ## Integrated GPU dispatch diagnostics
+
+          This build includes upstream PR 1323. Set XCL_GPU_CULPRIT=1 to record dispatch markers.
+          Pending dispatches are reported on GPU-wait releases and device removal, subject to the
+          upstream diagnostic rate limit. With the variable unset, instrumentation stays off.
+          This records evidence of stalled GPU work; it does not establish a graphics-hang fix.
+          '@, [Text.UTF8Encoding]::new($false))
+          git add crates/xcl/src/hle/d3d12x/real.rs README.md
+          git commit -m "D3D12.X: report pending dispatch markers on device removal" -m "Extend the opt-in upstream diagnostics to the failure captured locally. Assisted-by: Codex (GPT-6)."
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record the diagnostic source revision' }
+      - name: Integrate reviewed GPU-view copy fix without replacing the runtime
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'c160d86ef2efe3a07e4dfb473e4fa72eafb413c0'
+          $head = 'f13de96bcd3e505bac3684c2e24d9f7fc3a99b3d'
+          git fetch --no-tags --depth=1 https://github.com/xcl-dev/xcl.git $base
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch pinned PR base' }
+          git fetch --no-tags --depth=1 https://github.com/philip-roy-jones/xcl.git $head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch pinned copy correction' }
+          $expected = @('crates/xcl/src/hle/d3d12x/list_x.rs','crates/xcl/src/hle/d3d12x/real.rs','crates/xcl/src/hle/d3d12x/title_textures.rs','crates/xcl/src/hle/kernelx.rs','tests/testtitle/src/gpu.rs')
+          $actual = @(git diff --name-only $base $head)
+          if ($LASTEXITCODE -ne 0 -or @(Compare-Object ($expected | Sort-Object) ($actual | Sort-Object)).Count -ne 0) { throw 'PR changed outside its five reviewed files' }
+          $patch = Join-Path $env:RUNNER_TEMP 'xcl-copy-gpu-view.patch'
+          git diff --binary --output=$patch $base $head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare pinned five-file patch' }
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Copy correction conflicts with preserved mesh/watchdog base' }
+          git apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot apply copy correction' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Copy patch whitespace check failed' }
+          git diff --stat
+          git add -- $expected
+          git commit -m "D3D12.X: integrate staged copies from GPU-only title views" -m "Import the reviewed five-file diff of xcl-dev/xcl PR 768 at f13de96bcd3e505bac3684c2e24d9f7fc3a99b3d on c160d86ef2efe3a07e4dfb473e4fa72eafb413c0. Upstream work by philip-roy-jones, including CPU staging from 7ROBE's PR 473 and queue fencing from PR 993. Integration assisted by Codex (GPT-6)."
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record matching integration source' }
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc --version
+      - name: Build native XCL
+        working-directory: xcl
+        run: cargo build --locked --release -p xcl
+      - name: Smoke test
+        working-directory: xcl
+        run: |
+          & target/release/xcl.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'XCL version check failed' }
+      - name: Build full workspace for end-to-end tests
+        working-directory: xcl
+        run: cargo build --locked --workspace
+      - name: Regression tests for backing pages and queue ownership
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          cargo test --locked -p xcl --lib copy_gpu_view_reads_each_mapping_and_leaves_holes_zero -- --test-threads=1 --nocapture 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/xcl-copy-pages.log"
+          if ($LASTEXITCODE -ne 0) { throw 'GPU-view backing page regression failed' }
+          cargo test --locked -p xcl --lib staged_copy_waits_for_its_own_queue_without_blocking_cpu_writes -- --test-threads=1 --nocapture 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/xcl-copy-fence.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Upload queue-ownership regression failed' }
+      - name: Upstream CI suite with documented no-GPU exception
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          cargo test --locked --workspace -- --test-threads=4 --skip test_title_runs_and_game_folder_is_untouched 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/xcl-ci-tests.log"
+          if ($LASTEXITCODE -ne 0) { throw "Test suite failed: $LASTEXITCODE" }
+      - name: Locate compiled library test harness
+        working-directory: xcl
+        shell: pwsh
+        run: |
+          $items = @(cargo test --locked -p xcl --lib --no-run --message-format=json | ForEach-Object {
+            try { $item = $_ | ConvertFrom-Json } catch { return }
+            if ($item.reason -eq 'compiler-artifact' -and $item.target.name -eq 'xcl' -and $item.profile.test -and $item.executable) { $item.executable }
+          })
+          if ($LASTEXITCODE -ne 0 -or $items.Count -ne 1) { throw 'Cannot locate unique compiled library test executable' }
+          $items[0] | Set-Content -Encoding utf8 $env:RUNNER_TEMP/xcl-test-path.txt
+      - name: Package standalone runtime and corresponding source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item xcl/target/release/xcl.exe,xcl/LICENSE,xcl/README.md dist
+          Copy-Item "$env:RUNNER_TEMP/xcl-ci-tests.log" dist/CI-TESTS.log
+          Copy-Item "$env:RUNNER_TEMP/xcl-copy-pages.log" dist/COPY-PAGES-TEST.log
+          Copy-Item "$env:RUNNER_TEMP/xcl-copy-fence.log" dist/COPY-FENCE-TEST.log
+          New-Item -ItemType Directory -Path dist/tests | Out-Null
+          $testExe = (Get-Content $env:RUNNER_TEMP/xcl-test-path.txt -Raw).Trim()
+          Copy-Item -LiteralPath $testExe -Destination dist/tests/xcl-tests.exe
+          Copy-Item -LiteralPath xcl/tests/data/testgame -Destination dist/tests/testgame -Recurse
+          Copy-Item xcl/target/debug/xcl_testtitle.exe,xcl/target/debug/testgame_mw.dll dist/tests/testgame
+          @'
+          Base: xcl-dev/xcl 9e3831e1f570d3646e53ab753b19ec07eb8f1485
+          Mesh: PR 541, seven commits through 6bd8f641040071b8a388c0ec3053c2b1483ddcdf
+          Watchdog: PR 1288, 9cdae10f0bdf21b64a80958a87498b8f8124ac1d
+          Copy correction: PR 768, f13de96bcd3e505bac3684c2e24d9f7fc3a99b3d (five-file diff on c160d86ef2efe3a07e4dfb473e4fa72eafb413c0).
+          The captured 16KB CopyMemoryToMemoryX from a GPU-only view is now staged from its CPU backing pages at submission.
+          Upload resources remain alive until the submitting queue fence completes, including a queue stalled longer than ten seconds.
+          COPY-PAGES-TEST.log and COPY-FENCE-TEST.log record targeted regression results; a skip is not execution coverage.
+          The bundled synthetic title also checks late CPU and GPU-view writes on ExecuteCommandLists, split lists and KickoffX.
+          This fixes the observed dropped-copy path. The later DEVICE_HUNG has not been established as the same defect.
+          Launcher: async=1, lazy=1, preload=0, DXC workers=6, sleep hold=100ms, no bind timeout, activity logging enabled.
+          CI-TESTS.log contains actual CI test output; GPU skips are not GPU coverage.
+          As in upstream CI, test_title_runs_and_game_folder_is_untouched is filtered out because the hosted runner has no supported GPU. The included tests/testgame fixture allows a real-GPU check locally.
+          This integration is intended to prevent the title's stall check counting time held in a pipeline build. Reaching gameplay is not established.
+          Diagnostics: PR 1323, a79d09d3d74525238429f83853622795f764d2e9, plus a diagnostic-only report on device removal.
+          Run XCL-Performance.cmd for the corrected normal profile; opt-in XCL-Diagnostico-GPU.cmd retains dispatch markers if the GPU hang persists.
+          DRED and the D3D12 debug layer are left off in the diagnostic launcher to preserve the existing pipeline-cache conditions.
+          GPU test harness: set XCL_DXC_DIR to this directory, then run tests/xcl-tests.exe --test-threads=4 --nocapture.
+          Integration prepared in ChatGPT Work by Codex (GPT-6). Runtime corrections retain their upstream authors and source provenance.
+          '@ | Set-Content -Encoding utf8 dist/BUILD-INFO.txt
+          @'
+          @echo off
+          setlocal
+          set "XCL_ASYNC_PSO=1"
+          set "XCL_LAZY_PSO=1"
+          set "XCL_PSO_PRELOAD=0"
+          set "XCL_DXC_THREADS=6"
+          set "XCL_SLEEP_HOLD=100"
+          set "XCL_PSO_WAIT_MS=0"
+          set "XCL_ACTIVITY=1"
+          set "GAME=%~1"
+          if not defined GAME set "GAME=D:\GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
+          if not defined GAME exit /b 2
+          set "GAME=%GAME:"=%"
+          if not exist "%GAME%" (
+            echo Path not found.
+            pause
+            exit /b 2
+          )
+          "%~dp0xcl.exe" run "%GAME%"
+          set "RC=%ERRORLEVEL%"
+          echo XCL exit code: %RC%
+          pause
+          exit /b %RC%
+          '@ | Set-Content -Encoding ascii dist/XCL-Performance.cmd
+          $launch = [IO.File]::ReadAllText('dist/XCL-Performance.cmd')
+          $diagnostic = 'setlocal' + "`r`n" + 'set "XCL_GPU_CULPRIT=1"' + "`r`n" + 'set "XCL_DRED="' + "`r`n" + 'set "XCL_D3D12_DEBUG="' + "`r`n" + 'set "XCL_NETWORK=0"'
+          [IO.File]::WriteAllText('dist/XCL-Diagnostico-GPU.cmd', $launch.Replace('setlocal', $diagnostic), [Text.Encoding]::ASCII)
+          $dxcZip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          $dxcDir = Join-Path $env:RUNNER_TEMP 'dxc'
+          Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
+          if ((Get-FileHash $dxcZip -Algorithm SHA256).Hash -ne '9ad895a6b039e3a8f8c22a1009f866800b840a74b50db9218d13319e215ea8a4') { throw 'DXC SHA256 mismatch' }
+          Expand-Archive $dxcZip -DestinationPath $dxcDir -Force
+          Copy-Item "$dxcDir/bin/x64/dxcompiler.dll","$dxcDir/bin/x64/dxil.dll" dist -Force
+          New-Item -ItemType Directory dist/DXC-notices | Out-Null
+          Get-ChildItem $dxcDir -File | Where-Object { $_.Name -match 'license|notice|readme' } | Copy-Item -Destination dist/DXC-notices
+          if (Test-Path xcl/target/release/xcl.pdb) { Copy-Item xcl/target/release/xcl.pdb dist }
+          git -C xcl rev-parse HEAD | Set-Content dist/UPSTREAM-COMMIT.txt
+          git -C xcl archive --format=zip --output="$env:GITHUB_WORKSPACE/dist/xcl-source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-gpu-view-copy-fix-windows-x64
+          path: dist/
+          if-no-files-found: error
