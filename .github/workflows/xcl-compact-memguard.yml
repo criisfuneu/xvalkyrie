@@ -1,0 +1,156 @@
+name: XCL Compact + Graphics Priority + HLSL Memory Guard
+on:
+  push:
+    branches:
+      - xcl-compact-memguard-20261124
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [compact, compact-priority]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout fresh pinned upstream and optionally port mesh
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'clone failed' }
+          git -C xcl-src checkout 930e8b49c1c2ec683d22c724a398b39111cd0e56
+          if ($LASTEXITCODE -ne 0) { throw 'upstream checkout failed' }
+          $main=(git -C xcl-src rev-parse HEAD).Trim()
+          "Source: upstream ivall/xcl main $main" | Set-Content provenance.txt
+          "Previously merged upstream fixes: native BCPack #905, PSO waits #891, upload and DXIL caching improvements" | Add-Content provenance.txt
+          # Preserve the working upstream mesh shader port; don't use PR455.
+          git -C xcl-src fetch origin pull/541/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR541 mesh fetch failed' }
+          $revs = @(git -C xcl-src rev-list --reverse --max-count=7 FETCH_HEAD)
+          if ($revs.Count -ne 7) { throw "Expected 7 mesh commits, found $($revs.Count)" }
+          foreach ($rev in $revs) {
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $rev
+            if ($LASTEXITCODE -ne 0) {
+              $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+              throw "PR541 forward-port conflict in $rev : $($unmerged -join ', ')"
+            }
+          }
+          "Mesh shader translation: upstream PR #541" | Add-Content provenance.txt
+
+          # Actual watchdog mitigation, not a skipped-draw workaround.
+          # PR1288 is one commit based on this current upstream main.
+          git -C xcl-src fetch origin pull/1288/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR1288 watchdog-hold fetch failed' }
+          $hold=(git -C xcl-src rev-parse FETCH_HEAD).Trim()
+          if ($hold -ne '95299f47ddc4dc842045f4c1b48cc7910eb7aa68') {
+            throw "Upstream PR1288 changed while preparing this tested build ($hold)"
+          }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $hold
+          if ($LASTEXITCODE -ne 0) { throw "PR1288 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
+          "Watchdog hold: PR #1288 $hold (XCL_SLEEP_HOLD=1; set 0 for baseline)" | Add-Content provenance.txt
+          "No XCL_PSO_WAIT_MS: do not skip draws or dispatches" | Add-Content provenance.txt
+          "Source head: $(git -C xcl-src rev-parse HEAD)" | Add-Content provenance.txt
+
+      - name: Add compact compute shader backend PR1315 + PR1316
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C xcl-src fetch origin pull/1316/head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR1316' }
+          # Pinned commits in the order provided by upstream PR1316; 1316 contains 1315.
+          $commits = @(
+            '636483aba38cfa256504d317d2d17bb2bd0029d6',
+            '2912ed3bf008643ece82ba7ce544331df302f16b',
+            '711897240007a7c906bd31b1bb571a15907f1269',
+            '5e312d5b3252d2a20a8a687bd4f2ef20eecfb877'
+          )
+          foreach ($commit in $commits) {
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $commit
+            if ($LASTEXITCODE -ne 0) {
+              $conflicts = @(git -C xcl-src diff --name-only --diff-filter=U)
+              throw "Compact PR cherry-pick conflict in $commit : $($conflicts -join ', ')"
+            }
+          }
+          "Compact compute: upstream PRs #1315/#1316, XCL_COMPACT_CS=auto (0 disables)" | Add-Content provenance.txt
+
+      - name: Prevent giant 148 MB structured HLSL program (upstream PR1321)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C xcl-src fetch origin pull/1321/head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR1321' }
+          $guard=(git -C xcl-src rev-parse FETCH_HEAD).Trim()
+          if ($guard -ne '156b0de6de0dc303141e9d1906bdb4efb1ab8290') {
+            throw "PR1321 changed unexpectedly ($guard)"
+          }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $guard
+          if ($LASTEXITCODE -ne 0) {
+            $conflicts = @(git -C xcl-src diff --name-only --diff-filter=U)
+            throw "PR1321 conflict with compact compute: $($conflicts -join ', ')"
+          }
+          "HLSL memory growth guard: upstream #1321 (structured >128 B per code B falls back to pc blocks)" | Add-Content provenance.txt
+
+      - name: Carefully port PR628 graphics-first scheduling to current XCL workers
+        if: matrix.variant == 'compact-priority'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          py experimental/fps/apply_graphics_priority.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Graphics-first patch rejected unexpected upstream source' }
+          git -C xcl-src diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Graphics-first patch has whitespace errors' }
+          "PR #628 worker scheduling adapted to modern PSO build(), preserving PR #1288" | Add-Content provenance.txt
+
+      - name: Apply game boot compatibility patch without editing game
+        shell: pwsh
+        run: |
+          py experimental/xcl/apply_fix.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Game loader compatibility patch failed or needs rebase' }
+
+      - name: Compile official source in release
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release --locked -p xcl
+
+      - name: Run XCL library regression tests
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+
+      - name: Bundle latest official Microsoft DXC DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip'
+          Invoke-WebRequest -Uri $url -OutFile dxcompiler-official.zip
+          Expand-Archive -Path dxcompiler-official.zip -DestinationPath dxc-release -Force
+          $dll = @(Get-ChildItem dxc-release -Recurse -File -Filter dxcompiler.dll | Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1)
+          if ($dll.Count -ne 1) { throw 'Official 64-bit DXC missing' }
+          $dxil = Join-Path $dll[0].DirectoryName 'dxil.dll'
+          if (-not (Test-Path $dxil)) { throw 'Matching dxil.dll missing' }
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item $dll[0].FullName output/dxcompiler.dll
+          Copy-Item $dxil output/dxil.dll
+          "Microsoft DirectXShaderCompiler v1.9.2609 from $url" | Set-Content output/DXC-SOURCE.txt
+
+      - name: Package with launcher
+        shell: pwsh
+        run: |
+          Copy-Item xcl-src/target/release/xcl.exe output/
+          Copy-Item xcl-src/LICENSE output/
+          Copy-Item xcl-src/THIRD_PARTY.md output/
+          Copy-Item provenance.txt output/
+          Copy-Item experimental/fps/* output/
+          Copy-Item experimental/memguard/* output/
+          Get-Item output/xcl.exe | Select-Object Name,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-${{ matrix.variant }}-memguard-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
