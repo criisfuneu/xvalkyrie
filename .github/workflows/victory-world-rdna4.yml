@@ -1,4 +1,4 @@
-name: VIctory World Shader + Root Views (Windows)
+name: VIctory World-Memory Optimizations (Windows)
 on:
   push:
     branches:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - name: Checkout launcher
         uses: actions/checkout@v4
-      - name: Compose latest VIctory and root-view shader improvements
+      - name: Compose latest VIctory and validated world-memory improvements
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -21,28 +21,31 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Clone VIctory failed' }
           git -C victory-src checkout ffe310eb2098e52169f4c44db5ffdabf43a72622
           if ($LASTEXITCODE -ne 0) { throw 'Pinned main checkout failed' }
-          # PR #709 includes stacked PR #294: 4 commits total.
-          git -C victory-src fetch origin pull/709/head
-          if ($LASTEXITCODE -ne 0) { throw 'PR 709 fetch failed' }
-          $commits = @(git -C victory-src rev-list --reverse ffe310eb2098e52169f4c44db5ffdabf43a72622..FETCH_HEAD)
-          if ($commits.Count -ne 4) { throw "Expected 4 stacked PR294/709 commits, got $($commits.Count)" }
-          foreach ($sha in $commits) {
-            git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $sha
-            if ($LASTEXITCODE -ne 0) {
-              $conflicts = @(git -C victory-src diff --name-only --diff-filter=U)
-              throw "Cannot cherry-pick $sha cleanly. Conflicts: $($conflicts -join ', '). Needs compatibility adaptation."
-            }
-          }
+          # Root UAV shader PR #294/#709 is not cherry-pick compatible with
+          # the latest main (three conflicts in emit); do not lose upstream fixes.
+          # Target known bottlenecks measured in actual world frames instead.
+          git -C victory-src fetch origin pull/322/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR322 fetch failed' }
+          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "PR322 conflicts: $(git -C victory-src diff --name-only --diff-filter=U)" }
+
+          git -C victory-src fetch origin pull/464/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR464 fetch failed' }
+          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "PR464 conflicts: $(git -C victory-src diff --name-only --diff-filter=U)" }
+
           $combined = (git -C victory-src rev-parse HEAD).Trim()
           "VIctory upstream main ffe310eb2098e52169f4c44db5ffdabf43a72622" | Set-Content provenance.txt
-          "Stacked PR #294 and #709 root SRV/UAV correctness, 4 commits" | Add-Content provenance.txt
+          "Memory copies: PR #322, avoid per-copy VirtualQuery overhead" | Add-Content provenance.txt
+          "Guarded unmapped blocks: PR #464, avoid re-copying holes every frame" | Add-Content provenance.txt
+          "Root-UAV PR #294/#709 not included, old branch conflicts with latest upstream" | Add-Content provenance.txt
           "Combined source commit $combined" | Add-Content provenance.txt
           "VIctory GPL-3.0-or-later; XCL stays separate" | Add-Content provenance.txt
       - name: Build release
         shell: pwsh
         working-directory: victory-src
         run: cargo build --release --locked -p victory
-      - name: Test root view and shader crates
+      - name: Test GPU memory and shaders
         shell: pwsh
         working-directory: victory-src
         run: cargo test --locked -p victory-shader -p victory-gpu --lib -- --test-threads=4
