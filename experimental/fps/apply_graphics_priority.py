@@ -23,6 +23,8 @@ replace_once(
     'use std::collections::HashMap;',
     'use std::collections::{HashMap, VecDeque};',
 )
+replace_once('use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};',
+             'use std::sync::{Arc, Condvar, Mutex, OnceLock};\n#[cfg(test)]\nuse std::sync::mpsc;')
 start_token = "fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {"
 end_token = "\n/// Release a pipeline state XCL owns (raw pointer, 0 = none)."
 if source.count(start_token) != 1 or source.count(end_token) != 1:
@@ -105,6 +107,8 @@ count = source.count(needle)
 if count != 2:
     raise RuntimeError(f'Expected exactly 2 async enqueue sites, got {count}')
 source = source.replace(needle, 'enqueue_priority(p);')
+# A demand bind can also re-queue a previously-preloaded pipeline using a clone.
+replace_once('let _ = queue().lock().unwrap().send(p.clone());', 'enqueue_priority(p.clone());')
 
 test = """
 #[cfg(test)]
