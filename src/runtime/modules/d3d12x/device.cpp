@@ -2237,11 +2237,8 @@ HRESULT translate_rejected_compute(const D3D12_SHADER_BYTECODE &original,
     std::fprintf(stderr, "[Runtime] rejected compute shader native instruction words: %zu\n",
                  words.size());
     std::fflush(stderr);
-    if (words.empty()) {
-        std::fprintf(stderr, "[Runtime] no extractable native GPU code; Xbox DXIL intrinsic lowering required\n");
-        std::fflush(stderr);
-        return E_NOTIMPL;
-    }
+    // The legacy word extractor and the FSSM translator use different readers.
+    // An empty diagnostic word count is not proof the translator cannot read it.
     std::string why;
     std::uint32_t at = ~0u;
     const auto source = modules::console_shader_source(modules::ShaderStage::compute, bytes,
