@@ -27,7 +27,26 @@ jobs:
           git -C xcl-src fetch origin pull/1053/head
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch fastboot PR 1053' }
           git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) { throw 'PR 1053 did not cherry-pick cleanly: STOP; no artifact created' }
+          if ($LASTEXITCODE -ne 0) {
+            # The mesh branch predates BCPack; fastboot adds "pub mod bink" near
+            # "pub mod bcpack". Preserve its older module table, adding bink.
+            $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+            if ($unmerged.Count -ne 1 -or $unmerged[0] -ne 'crates/xcl/src/hle/mod.rs') {
+              throw "Unexpected conflicts: $($unmerged -join ', ')"
+            }
+            git -C xcl-src checkout --ours -- crates/xcl/src/hle/mod.rs
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot recover mesh branch module declarations' }
+            $modPath = 'xcl-src/crates/xcl/src/hle/mod.rs'
+            $contents = [System.IO.File]::ReadAllText((Resolve-Path $modPath))
+            if (-not $contents.Contains('pub mod bink;')) {
+              if (-not $contents.Contains('pub mod acphal;')) { throw 'Unexpected module layout' }
+              $contents = $contents.Replace('pub mod acphal;', "pub mod acphal;`npub mod bink;")
+              [System.IO.File]::WriteAllText((Resolve-Path $modPath), $contents)
+            }
+            git -C xcl-src add crates/xcl/src/hle/mod.rs
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick --continue
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot complete cherry-pick after reviewed module conflict' }
+          }
           $fastboot = (git -C xcl-src rev-parse HEAD).Trim()
           "Mesh PR head: $mesh" | Set-Content -Path source-commits.txt
           "Fastboot cherry-pick commit: $fastboot" | Add-Content -Path source-commits.txt
