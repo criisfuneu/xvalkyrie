@@ -29,6 +29,15 @@ jobs:
           Copy-Item "$($exe.Directory.FullName)\*" dist -Recurse -Force
           if (-not (Test-Path dist/xvboot.exe)) { throw 'Missing xvboot.exe' }
           Copy-Item LICENSE,THIRD-PARTY.md,README.md dist
+          # Ship a matching compiler and validator from the official Microsoft release.
+          $dxcZip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          $dxcDir = Join-Path $env:RUNNER_TEMP 'dxc'
+          Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
+          if ((Get-FileHash $dxcZip -Algorithm SHA256).Hash -ne '9ad895a6b039e3a8f8c22a1009f866800b840a74b50db9218d13319e215ea8a4') { throw 'DXC SHA256 mismatch' }
+          Expand-Archive $dxcZip -DestinationPath $dxcDir -Force
+          Copy-Item "$dxcDir/bin/x64/dxcompiler.dll","$dxcDir/bin/x64/dxil.dll" dist -Force
+          New-Item -ItemType Directory dist/DXC-notices | Out-Null
+          Get-ChildItem $dxcDir -File | Where-Object { $_.Name -match 'license|notice|readme' } | Copy-Item -Destination dist/DXC-notices
           Get-ChildItem dist -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
