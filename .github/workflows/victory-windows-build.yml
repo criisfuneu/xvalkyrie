@@ -1,0 +1,56 @@
+name: Build VIctory experimental for Windows
+
+on:
+  push:
+    branches:
+      - victory-test-20261124
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-victory:
+    runs-on: windows-latest
+    timeout-minutes: 70
+    steps:
+      - name: Checkout experiment branch
+        uses: actions/checkout@v4
+      - name: Checkout pinned VIctory source (GPL-3.0-or-later)
+        shell: pwsh
+        run: |
+          git clone --no-checkout https://github.com/Marvisak/VIctory.git victory-src
+          git -C victory-src checkout ffe310eb2098e52169f4c44db5ffdabf43a72622
+      - name: Windows toolchain
+        shell: pwsh
+        working-directory: victory-src
+        run: |
+          rustup show
+          cargo --version
+          rustc --version
+      - name: Build release executable
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo build --release --locked -p victory
+      - name: Verify binary exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "victory-src/target/release/victory.exe")) { throw "victory.exe missing" }
+          Get-Item "victory-src/target/release/victory.exe" | Select-Object FullName,Length
+          & "victory-src/target/release/victory.exe" --help
+      - name: Prepare portable test package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item victory-src/target/release/victory.exe output/
+          Copy-Item victory-src/victory.example.toml output/
+          Copy-Item victory-src/README.md output/
+          Copy-Item victory-src/LICENSE output/
+          "VIctory source: Marvisak/VIctory commit ffe310eb2098e52169f4c44db5ffdabf43a72622" | Set-Content -Path output/build-info.txt -Encoding UTF8
+      - name: Upload standalone VIctory
+        uses: actions/upload-artifact@v4
+        with:
+          name: victory-windows-20261124-experimental
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
