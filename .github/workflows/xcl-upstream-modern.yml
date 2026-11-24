@@ -1,0 +1,94 @@
+name: XCL Upstream Main 2026-11-24 + Optional Mesh Port
+on:
+  push:
+    branches:
+      - xcl-upstream-modern-20261124
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [upstream, upstream-mesh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout fresh pinned upstream and optionally port mesh
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'clone failed' }
+          git -C xcl-src checkout 930e8b49c1c2ec683d22c724a398b39111cd0e56
+          if ($LASTEXITCODE -ne 0) { throw 'upstream checkout failed' }
+          $main=(git -C xcl-src rev-parse HEAD).Trim()
+          "Source: upstream ivall/xcl main $main" | Set-Content provenance.txt
+          "Previously merged upstream fixes: native BCPack #905, PSO waits #891, upload and DXIL caching improvements" | Add-Content provenance.txt
+          if ('${{ matrix.variant }}' -eq 'upstream-mesh') {
+            git -C xcl-src fetch origin pull/541/head
+            if ($LASTEXITCODE -ne 0) { throw 'PR541 fetch failed' }
+            $revs = @(git -C xcl-src rev-list --reverse --max-count=7 FETCH_HEAD)
+            if ($revs.Count -ne 7) { throw "Expected 7 mesh commits, found $($revs.Count)" }
+            foreach ($rev in $revs) {
+              git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $rev
+              if ($LASTEXITCODE -ne 0) {
+                $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+                throw "PR541 forward-port requires manual review for $rev : $($unmerged -join ', ')"
+              }
+            }
+            "Source additionally includes PR #541 mesh changes ported to upstream main" | Add-Content provenance.txt
+          } else {
+            "No experimental PR541 overlay: pure upstream graphics code" | Add-Content provenance.txt
+          }
+
+      - name: Apply game boot compatibility patch without editing game
+        shell: pwsh
+        run: |
+          py experimental/xcl/apply_fix.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Game loader compatibility patch failed or needs rebase' }
+
+      - name: Compile official source in release
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release --locked -p xcl
+
+      - name: Run XCL library regression tests
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+
+      - name: Bundle latest official Microsoft DXC DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip'
+          Invoke-WebRequest -Uri $url -OutFile dxcompiler-official.zip
+          Expand-Archive -Path dxcompiler-official.zip -DestinationPath dxc-release -Force
+          $dll = @(Get-ChildItem dxc-release -Recurse -File -Filter dxcompiler.dll | Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1)
+          if ($dll.Count -ne 1) { throw 'Official 64-bit DXC missing' }
+          $dxil = Join-Path $dll[0].DirectoryName 'dxil.dll'
+          if (-not (Test-Path $dxil)) { throw 'Matching dxil.dll missing' }
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item $dll[0].FullName output/dxcompiler.dll
+          Copy-Item $dxil output/dxil.dll
+          "Microsoft DirectXShaderCompiler v1.9.2609 from $url" | Set-Content output/DXC-SOURCE.txt
+
+      - name: Package with launcher
+        shell: pwsh
+        run: |
+          Copy-Item xcl-src/target/release/xcl.exe output/
+          Copy-Item xcl-src/LICENSE output/
+          Copy-Item xcl-src/THIRD_PARTY.md output/
+          Copy-Item provenance.txt output/
+          Copy-Item experimental/modern/* output/
+          Get-Item output/xcl.exe | Select-Object Name,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-${{ matrix.variant }}-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
