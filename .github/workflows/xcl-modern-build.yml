@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [updated-main, mesh-preview]
+        variant: [updated-main, mesh-preview, dstorage-preview]
     steps:
       - name: Checkout project fixes
         uses: actions/checkout@v4
@@ -26,11 +26,20 @@ jobs:
           git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
           if ('${{ matrix.variant }}' -eq 'updated-main') {
             $sha = '47efa2ecea0a12934719ae69b81930cf02a4b1c3'
+            git -C xcl-src checkout $sha
+          } elseif ('${{ matrix.variant }}' -eq 'mesh-preview') {
+            # PR commits may not be reachable from main, so fetch the PR ref explicitly
+            git -C xcl-src fetch origin pull/541/head
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR 541' }
+            git -C xcl-src checkout FETCH_HEAD
+            $sha = (git -C xcl-src rev-parse HEAD).Trim()
           } else {
-            # PR #541 includes its #304 prerequisite
-            $sha = '6bd8f641040071b8a388c0ec3053c2b1483ddcdf'
+            git -C xcl-src fetch origin pull/979/head
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR 979' }
+            git -C xcl-src checkout FETCH_HEAD
+            $sha = (git -C xcl-src rev-parse HEAD).Trim()
           }
-          git -C xcl-src checkout $sha
+          if ($LASTEXITCODE -ne 0) { throw "Cannot checkout $sha" }
           Write-Output "Source: $sha"
       - name: Keep fixed-base FidelityFX and xmem loader fixes
         shell: pwsh
@@ -51,11 +60,9 @@ jobs:
           New-Item -ItemType Directory -Force output | Out-Null
           Copy-Item xcl-src/target/release/xcl.exe output/
           Copy-Item xcl-src/LICENSE output/
-          if ('${{ matrix.variant }}' -eq 'updated-main') {
-            $sha = '47efa2ecea0a12934719ae69b81930cf02a4b1c3'
-          } else {
-            $sha = '6bd8f641040071b8a388c0ec3053c2b1483ddcdf'
-          }
+          $sha = (git -C xcl-src rev-parse HEAD).Trim()
+          New-Item -ItemType Directory -Force output/launcher | Out-Null
+          Copy-Item experimental/launcher/* output/launcher/
           "Upstream: ivall/xcl`nSource commit: $sha`nVariant: ${{ matrix.variant }}`nLocal modifications: experimental/xcl/apply_fix.py`nNo game files or Microsoft SDK files included." |
             Set-Content output/build-info.txt -Encoding UTF8
       - name: Upload test build
@@ -65,3 +72,23 @@ jobs:
           path: output/
           if-no-files-found: error
           retention-days: 7
+
+  launcher-standalone:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout launcher's source
+        uses: actions/checkout@v4
+      - name: Package launcher scripts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path experimental/launcher/XValLauncher.ps1)) { throw 'Missing launcher' }
+          New-Item -ItemType Directory -Force launcher | Out-Null
+          Copy-Item experimental/launcher/* launcher/
+      - name: Upload launcher
+        uses: actions/upload-artifact@v4
+        with:
+          name: xval-launcher-windows-20261124
+          path: launcher/
+          if-no-files-found: error
+          retention-days: 14
