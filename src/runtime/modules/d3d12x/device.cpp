@@ -2226,6 +2226,66 @@ HRESULT validate_compute_shader(const D3D12_SHADER_BYTECODE &code) {
     std::fflush(stderr);
     return status;
 }
+// A console container can have Xbox-specific LLVM bitcode and also carry native GPU
+// instructions. If desktop validation rejects the original, attempt a real translation
+// from those instructions. Do not use an empty stand-in for this fallback.
+HRESULT translate_rejected_compute(const D3D12_SHADER_BYTECODE &original,
+                                   const void *root,
+                                   Microsoft::WRL::ComPtr<IDxcBlob> &compiled) {
+    const auto bytes = shader_bytes(original);
+    const auto words = modules::console_shader_code(bytes);
+    std::fprintf(stderr, "[Runtime] rejected compute shader native instruction words: %zu\n",
+                 words.size());
+    std::fflush(stderr);
+    if (words.empty()) {
+        std::fprintf(stderr, "[Runtime] no extractable native GPU code; Xbox DXIL intrinsic lowering required\n");
+        std::fflush(stderr);
+        return E_NOTIMPL;
+    }
+    std::string why;
+    std::uint32_t at = ~0u;
+    const auto source = modules::console_shader_source(modules::ShaderStage::compute, bytes,
+                                                      &why, &at, signature_part(root));
+    if (!source || source->empty()) {
+        std::fprintf(stderr, "[Runtime] native compute translation stopped at word %u: %s\n",
+                     at, why.c_str());
+        std::fflush(stderr);
+        return E_NOTIMPL;
+    }
+    using Microsoft::WRL::ComPtr;
+    ComPtr<IDxcCompiler3> compiler;
+    auto hr = modules::host_dxc_create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
+    if (FAILED(hr))
+        return hr;
+    const wchar_t *args[] = {L"-E", L"main", L"-T", L"cs_6_6", L"-HV", L"2018",
+                            source->size() > 48'000 ? L"-Od" : L"-O3"};
+    const DxcBuffer input{source->data(), source->size(), DXC_CP_UTF8};
+    ComPtr<IDxcResult> result;
+    hr = compiler->Compile(&input, args, static_cast<UINT32>(std::size(args)), nullptr,
+                           IID_PPV_ARGS(&result));
+    if (FAILED(hr) || !result)
+        return FAILED(hr) ? hr : E_FAIL;
+    HRESULT status = E_FAIL;
+    hr = result->GetStatus(&status);
+    if (FAILED(hr))
+        return hr;
+    if (FAILED(status)) {
+        ComPtr<IDxcBlobUtf8> errors;
+        if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) && errors)
+            std::fprintf(stderr, "[Runtime] native compute DXC: %.*s\n",
+                         static_cast<int>(std::min<SIZE_T>(errors->GetStringLength(), 8192)),
+                         errors->GetStringPointer());
+        std::fflush(stderr);
+        return status;
+    }
+    hr = result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&compiled), nullptr);
+    if (FAILED(hr) || !compiled)
+        return FAILED(hr) ? hr : E_FAIL;
+    std::fprintf(stderr, "[Runtime] native compute recompiled to %zu bytes of desktop DXIL\n",
+                 static_cast<std::size_t>(compiled->GetBufferSize()));
+    std::fflush(stderr);
+    return S_OK;
+}
 // Keep a flushed, thread-correlated trace immediately around host PSO calls.
 // A driver exception can terminate execution before an HRESULT is returned.
 struct HostPsoTrace {
@@ -2549,6 +2609,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
             *state = nullptr;
         return E_INVALIDARG;
     }
+    Microsoft::WRL::ComPtr<IDxcBlob> recovered_compute;
     if (desc) {
         std::fprintf(stderr, "[Runtime] compute input: original %zu bytes, host %zu bytes, translated %s, root data %zu bytes\n",
                      static_cast<std::size_t>(desc->CS.BytecodeLength),
@@ -2556,7 +2617,16 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
                      host.CS.pShaderBytecode != desc->CS.pShaderBytecode ? "yes" : "no",
                      signature_part(host.pRootSignature).size());
         std::fflush(stderr);
-        const auto valid = validate_compute_shader(host.CS);
+        auto valid = validate_compute_shader(host.CS);
+        if (FAILED(valid) && valid != E_NOINTERFACE &&
+            console == Target::scarlett && !emptied) {
+            const auto recovered = translate_rejected_compute(desc->CS, host.pRootSignature,
+                                                               recovered_compute);
+            if (SUCCEEDED(recovered) && recovered_compute) {
+                host.CS = {recovered_compute->GetBufferPointer(), recovered_compute->GetBufferSize()};
+                valid = validate_compute_shader(host.CS);
+            }
+        }
         if (FAILED(valid)) {
             if (from_shader)
                 from_shader->Release();
