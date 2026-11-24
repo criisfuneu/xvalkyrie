@@ -1,0 +1,31 @@
+XCL Compact + MemGuard + Graphics-first 2026-11-24
+
+O que o log xcl(5).log comprovou:
+- 9.907 MB commit em 14 s; 47.257 MB em 40 s (aprox +2,2 GB/s entre 28 e 40 s).
+- Depois, DirectStorage 0x800705aa; CreateComputePipelineState 0x8007000e; crash 0xc0000005 em +0x56edab.
+- 1.123 presents, 922 translated pipelines, 0 dispatches nas amostras exibidas. Apenas 2 compilações DXC, 1557 cache hits.
+- Portanto, esse teste nao demonstrou melhora de FPS no mundo 3D; terminou por esgotamento de recursos de memoria.
+
+Nesta versao:
+1. Upstream PR #1321 protege contra HLSL estruturado absurdo de 148MB e retorna ao formato pc blocks acima de 128 bytes de HLSL por byte do shader original.
+2. PR #1315/#1316: compact compute shaders nas situacoes apropriadas, com fallback.
+3. PR #1288: watchdog hold.
+4. Variante compact-priority: agendamento grafico prioritario adaptado do PR #628.
+5. XCL_PSO_PRELOAD=0 por padrao para evitar pre-compilar 1174 shaders usados em execucoes anteriores de uma so vez.
+6. XCL_PSO_WAIT_MS=0: sem pular draw ou dispatch.
+7. Cache de shaders conservado; nenhuma alteracao nos arquivos do jogo.
+
+Como testar:
+- Feche o XCL que estiver aberto.
+- Extraia este ZIP em uma pasta nova, NAO sobre a versao antiga.
+- Execute Iniciar-Memoria-Segura.cmd.
+- Acompanhe o Gerenciador de Tarefas > Desempenho > Memoria > Confirmado. Se passar de 45GB em uma maquina com limite 52,7GB, encerre para proteger a estabilidade.
+- Primeiro objetivo: comprovar que o commit para de subir acima de ~30GB e que consegue ultrapassar os 45 segundos em que o teste anterior caiu.
+- Segundo objetivo: comparar FPS, tempo ate a intro e registros de mundo. 30 fps de presentacao nao equivale aos fps do video.
+- Se precisar voltar a comparar: o comando Comparar-FPS-Sem-Compacto.cmd desabilita somente a traducao compacta; permanece o guard da memoria.
+
+Avisos:
+- PR #1321 e PR #1316 ainda sao experimentais; nem esta combinacao nem o jogo foram validados diretamente na GPU RX 9070 XT.
+- Este guard nao resolve por si so DXGI_ERROR_DEVICE_HUNG 0x887a0006, loops GPU ou stubs Xbox nao implementados.
+- Desligar preload pode aumentar pausas na primeira execucao, mas deixa para compilar quando necessario.
+- Codigos e testes de CI nao garantem funcionamento do jogo.
