@@ -1,0 +1,53 @@
+name: XCL native Windows x64
+on:
+  push:
+    branches: ["build/xcl-native"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: xcl-dev/xcl
+          ref: 9e3831e1f570d3646e53ab753b19ec07eb8f1485
+          path: xcl
+          persist-credentials: false
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc --version
+      - name: Build native XCL
+        working-directory: xcl
+        run: cargo build --locked --release -p xcl
+      - name: Smoke test
+        working-directory: xcl
+        run: |
+          & target/release/xcl.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'XCL version check failed' }
+      - name: Upstream unit tests
+        working-directory: xcl
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+      - name: Package standalone runtime and corresponding source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item xcl/target/release/xcl.exe,xcl/LICENSE,xcl/README.md dist
+          if (Test-Path xcl/target/release/xcl.pdb) { Copy-Item xcl/target/release/xcl.pdb dist }
+          git -C xcl rev-parse HEAD | Set-Content dist/UPSTREAM-COMMIT.txt
+          git -C xcl archive --format=zip --output="$env:GITHUB_WORKSPACE/dist/xcl-source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+          Get-ChildItem dist -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring((Resolve-Path dist).Path.Length + 1))" } | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcl-native-9e3831e-windows-x64
+          path: dist/
+          if-no-files-found: error
