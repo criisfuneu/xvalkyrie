@@ -1,0 +1,109 @@
+name: VIctory Geometry Target Preview and Descriptor Fix (WARP diagnostics)
+on:
+  push:
+    branches:
+      - victory-target-preview-20261124
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  victory-world:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [preview-only, preview-descriptor]
+    steps:
+      - name: Checkout launcher
+        uses: actions/checkout@v4
+      - name: Compose latest VIctory and validated world-memory improvements
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/Marvisak/VIctory.git victory-src
+          if ($LASTEXITCODE -ne 0) { throw 'Clone VIctory failed' }
+          git -C victory-src checkout ffe310eb2098e52169f4c44db5ffdabf43a72622
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned main checkout failed' }
+          # Root UAV shader PR #294/#709 is not cherry-pick compatible with
+          # the latest main (three conflicts in emit); do not lose upstream fixes.
+          # Target known bottlenecks measured in actual world frames instead.
+          git -C victory-src fetch origin pull/322/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR322 fetch failed' }
+          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "PR322 conflicts: $(git -C victory-src diff --name-only --diff-filter=U)" }
+
+          # PR464 does not cherry-pick onto main after its overflow fix.
+          # Apply a guarded, assertion-checked port; keep main's saturating math.
+          py experimental/victory/apply_watch_absent.py victory-src
+          if ($LASTEXITCODE -ne 0) { throw 'PR464 backport failed: source layout changed' }
+
+          $combined = (git -C victory-src rev-parse HEAD).Trim()
+          "VIctory upstream main ffe310eb2098e52169f4c44db5ffdabf43a72622" | Set-Content provenance.txt
+          "Memory copies: PR #322, avoid per-copy VirtualQuery overhead" | Add-Content provenance.txt
+          "Guarded unmapped blocks: PR #464 manually backported via experimental/victory/apply_watch_absent.py" | Add-Content provenance.txt
+          "Root-UAV PR #294/#709 not included, old branch conflicts with latest upstream" | Add-Content provenance.txt
+          "Combined source commit $combined" | Add-Content provenance.txt
+          "VIctory GPL-3.0-or-later; XCL stays separate" | Add-Content provenance.txt
+      - name: Add verified target preview PR530 (diagnostics only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C victory-src fetch origin pull/530/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR530 unavailable' }
+          $rev = (git -C victory-src rev-parse FETCH_HEAD).Trim()
+          if ($rev -ne '951ceb1eb8dac4034bf2ecec8e9b32a5df1010a6') { throw "PR530 changed: $rev" }
+          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $rev
+          if ($LASTEXITCODE -ne 0) {
+            $conflicts = @(git -C victory-src diff --name-only --diff-filter=U)
+            throw "PR530 conflicts: $($conflicts -join ', ')"
+          }
+          "Preview geometry target 2560x1440-f28: upstream PR530" | Add-Content provenance.txt
+
+      - name: Optionally fix descriptor-only shader reads PR1067
+        if: matrix.variant == 'preview-descriptor'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git -C victory-src fetch origin pull/1067/head
+          if ($LASTEXITCODE -ne 0) { throw 'PR1067 unavailable' }
+          $rev = (git -C victory-src rev-parse FETCH_HEAD).Trim()
+          if ($rev -ne '6d30fd71c28f40bc46fa17330409b98feb050295') { throw "PR1067 changed: $rev" }
+          git -C victory-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $rev
+          if ($LASTEXITCODE -ne 0) {
+            $conflicts = @(git -C victory-src diff --name-only --diff-filter=U)
+            throw "PR1067 conflicts: $($conflicts -join ', ')"
+          }
+          "Recover shader descriptor-only reads: upstream PR1067" | Add-Content provenance.txt
+
+      - name: Build diagnostics with render target preview
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo build --release --locked -p victory
+      - name: Test GPU memory and shaders
+        shell: pwsh
+        working-directory: victory-src
+        run: cargo test --locked -p victory-shader -p victory-gpu --lib -- --test-threads=4
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item victory-src/target/diag/victory.exe output/
+          Copy-Item victory-src/victory.example.toml output/
+          Copy-Item victory-src/README.md output/UPSTREAM_README.md
+          Copy-Item victory-src/LICENSE output/
+          Copy-Item experimental/victory/* output/
+          Copy-Item experimental/victory-preview/* output/
+          Copy-Item provenance.txt output/
+          & "output/victory.exe" --help
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic executable failed self-check' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-${{ matrix.variant }}-warp-preview-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
