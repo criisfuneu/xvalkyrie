@@ -100,10 +100,9 @@ jobs:
           git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "PR 1092 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
 
-          git -C xcl-src fetch origin pull/1106/head
-          if ($LASTEXITCODE -ne 0) { throw 'Empty-overlay VFS PR 1106 fetch failed' }
-          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) { throw "PR 1106 conflicts: $(git -C xcl-src diff --name-only --diff-filter=U)" }
+          # PR #1106 would optimize empty-overlay checks further, but its
+          # changes conflict with PR #1092 on the pinned mesh base.
+          # Preserve the tested VFS semantics; leave #1106 for a careful port.
 
           $last=(git -C xcl-src rev-parse HEAD).Trim()
           "Mesh base: $mesh" | Set-Content provenance.txt -Encoding UTF8
@@ -114,7 +113,7 @@ jobs:
           "DirectStorage late pages: PR #549" | Add-Content provenance.txt
           "DirectStorage CPU/GPU views: PR #979 excluded due to reproducible BC fill test failure" | Add-Content provenance.txt
           "Fast-read VFS: PR #1092 (remove redundant metadata checks)" | Add-Content provenance.txt
-          "Empty-overlay VFS: PR #1106 (no redundant probes)" | Add-Content provenance.txt
+          "Empty-overlay VFS: PR #1106 not included (vfs.rs conflict)" | Add-Content provenance.txt
           "Streaming decompression: unchanged (no untested PR #819)" | Add-Content provenance.txt
           "Combined source commit: $last" | Add-Content provenance.txt
 
