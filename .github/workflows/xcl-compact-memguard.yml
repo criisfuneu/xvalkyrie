@@ -78,22 +78,17 @@ jobs:
           }
           "Compact compute: upstream PRs #1315/#1316, XCL_COMPACT_CS=auto (0 disables)" | Add-Content provenance.txt
 
-      - name: Prevent giant 148 MB structured HLSL program (upstream PR1321)
+      - name: Adapt PR1321 oversized structured HLSL guard to compact backend
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git -C xcl-src fetch origin pull/1321/head
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR1321' }
-          $guard=(git -C xcl-src rev-parse FETCH_HEAD).Trim()
-          if ($guard -ne '156b0de6de0dc303141e9d1906bdb4efb1ab8290') {
-            throw "PR1321 changed unexpectedly ($guard)"
-          }
-          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick $guard
-          if ($LASTEXITCODE -ne 0) {
-            $conflicts = @(git -C xcl-src diff --name-only --diff-filter=U)
-            throw "PR1321 conflict with compact compute: $($conflicts -join ', ')"
-          }
-          "HLSL memory growth guard: upstream #1321 (structured >128 B per code B falls back to pc blocks)" | Add-Content provenance.txt
+          # #1316 refactored translate() into prepare(), so cherry-picking #1321
+          # conflicts in mod.rs. Apply an exact, guarded 3-hunk port instead.
+          py experimental/memguard/apply_structured_guard.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected translator source, refusing guard patch' }
+          git -C xcl-src diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid guard patch formatting' }
+          "Structured HLSL over 128 B per code B: PR #1321 safely ported onto PR #1316" | Add-Content provenance.txt
 
       - name: Carefully port PR628 graphics-first scheduling to current XCL workers
         if: matrix.variant == 'compact-priority'
