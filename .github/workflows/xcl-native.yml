@@ -41,6 +41,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item xcl/target/release/xcl.exe,xcl/LICENSE,xcl/README.md dist
+          $dxcZip = Join-Path $env:RUNNER_TEMP 'dxc.zip'
+          $dxcDir = Join-Path $env:RUNNER_TEMP 'dxc'
+          Invoke-WebRequest 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip' -OutFile $dxcZip
+          if ((Get-FileHash $dxcZip -Algorithm SHA256).Hash -ne '9ad895a6b039e3a8f8c22a1009f866800b840a74b50db9218d13319e215ea8a4') { throw 'DXC SHA256 mismatch' }
+          Expand-Archive $dxcZip -DestinationPath $dxcDir -Force
+          Copy-Item "$dxcDir/bin/x64/dxcompiler.dll","$dxcDir/bin/x64/dxil.dll" dist -Force
+          New-Item -ItemType Directory dist/DXC-notices | Out-Null
+          Get-ChildItem $dxcDir -File | Where-Object { $_.Name -match 'license|notice|readme' } | Copy-Item -Destination dist/DXC-notices
           if (Test-Path xcl/target/release/xcl.pdb) { Copy-Item xcl/target/release/xcl.pdb dist }
           git -C xcl rev-parse HEAD | Set-Content dist/UPSTREAM-COMMIT.txt
           git -C xcl archive --format=zip --output="$env:GITHUB_WORKSPACE/dist/xcl-source.zip" HEAD
