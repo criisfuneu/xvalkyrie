@@ -1,0 +1,96 @@
+name: Build XCL Mesh + Optimized Video + Optional Skip
+
+on:
+  push:
+    branches:
+      - xcl-mesh-video-performance-20261124
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  video-opt:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble mesh, async texture upload, and Bink skip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --no-checkout https://github.com/ivall/xcl.git xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'XCL clone failed' }
+          git -C xcl-src fetch origin pull/541/head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR 541' }
+          git -C xcl-src checkout FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot checkout mesh PR' }
+          $mesh = (git -C xcl-src rev-parse HEAD).Trim()
+
+          git -C xcl-src fetch origin pull/455/head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR 455' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+            throw "Async texture upload PR 455 conflicts: $($unmerged -join ', ')"
+          }
+
+          git -C xcl-src fetch origin pull/1053/head
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot fetch PR 1053' }
+          git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) {
+            $unmerged = @(git -C xcl-src diff --name-only --diff-filter=U)
+            if ($unmerged.Count -ne 1 -or $unmerged[0] -ne 'crates/xcl/src/hle/mod.rs') {
+              throw "Unexpected fastboot conflicts: $($unmerged -join ', ')"
+            }
+            git -C xcl-src checkout --ours -- crates/xcl/src/hle/mod.rs
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot restore module table' }
+            $modPath = 'xcl-src/crates/xcl/src/hle/mod.rs'
+            $contents = [System.IO.File]::ReadAllText((Resolve-Path $modPath))
+            if (-not $contents.Contains('pub mod bink;')) {
+              if (-not $contents.Contains('pub mod acphal;')) { throw 'Unexpected module layout' }
+              $contents = $contents.Replace('pub mod acphal;', ('pub mod acphal;' + [Environment]::NewLine + 'pub mod bink;'))
+              [System.IO.File]::WriteAllText((Resolve-Path $modPath), $contents)
+            }
+            git -C xcl-src add crates/xcl/src/hle/mod.rs
+            git -C xcl-src -c user.name=XValCI -c user.email=xval-ci@example.invalid cherry-pick --continue
+            if ($LASTEXITCODE -ne 0) { throw 'Fastboot cherry-pick not resolved' }
+          }
+          $head = (git -C xcl-src rev-parse HEAD).Trim()
+          "Base mesh PR 541: $mesh" | Set-Content -Path provenance.txt -Encoding UTF8
+          "Async upload PR 455: 4a514ae75a00336d0b461a72bc9650bc9f9a4510" | Add-Content -Path provenance.txt
+          "Bink skip PR 1053: 4f4db6452875984c003623ec8aef9f7e54df5ed9" | Add-Content -Path provenance.txt
+          "Combined source: $head" | Add-Content -Path provenance.txt
+
+      - name: Apply known-good loader adaptations
+        shell: pwsh
+        run: |
+          py experimental/xcl/apply_fix.py xcl-src
+          if ($LASTEXITCODE -ne 0) { throw 'Loader patch could not be applied' }
+
+      - name: Build optimized Windows executable
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo build --release --locked -p xcl
+
+      - name: Test library
+        shell: pwsh
+        working-directory: xcl-src
+        run: cargo test --locked -p xcl --lib -- --test-threads=4
+
+      - name: Package tested executable and launch options
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          Copy-Item xcl-src/target/release/xcl.exe output/
+          Copy-Item xcl-src/LICENSE output/
+          Copy-Item provenance.txt output/
+          Copy-Item experimental/video/* output/
+
+      - name: Upload experimental ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcl-mesh-video-optimized-20261124
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
